@@ -8,7 +8,7 @@
 # --------------------------------------------------------------------
 
 # --- V-JEPA 2.1 encoder ---------------------------------------------------
-model_name: vit_large
+model_name: vit_base
 img_size: 256
 num_frames: 4
 tubelet_size: 2
@@ -32,7 +32,7 @@ use_inverted_attention: true        # inverted cross-attn (reference repo defaul
 
 # --- Data -----------------------------------------------------------------
 NF: 4
-VCL: 32
+VCL: 16
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota
