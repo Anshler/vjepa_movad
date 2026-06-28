@@ -1,0 +1,50 @@
+vjepa_movad NOTICE
+==================
+
+This project combines original code with components from several open-source
+projects.  The combined work is distributed under the GNU General Public
+License v2 (see LICENSE file).
+
+
+Third-party components
+----------------------
+
+1.  MOVAD (https://github.com/hachreak/movad)
+    Files:  src/dota.py, src/data_transform.py, src/models.py, src/main.py,
+            src/utils.py, src/plot.py, and derivatives thereof.
+    License:  GPL v2
+    These files originate from the MOVAD anomaly detection project and are
+    the reason the combined work is GPL v2 (§2b).
+
+2.  V-JEPA 2 / V-JEPA 2.1 (https://github.com/facebookresearch/vjepa2)
+    Files:  vjepa_encoder.py and any V-JEPA model weights / code adapted
+            from the Meta V-JEPA repository.
+    License:  MIT — Copyright (c) Meta Platforms, Inc. and affiliates.
+
+3.  SlotSSMs (https://github.com/JindongJiang/SlotSSMs)
+    Files:  Mamba / Mamba2 SSM blocks and supporting code.
+    License:  MIT — Copyright (c) 2024 Jindong Jiang
+
+
+Original contributions
+----------------------
+
+All original code written for vjepa_movad (configs, training scripts, new
+model components that are not derivative of the MOVAD GPL code) is also
+offered under the MIT license:
+
+    MIT License — Copyright (c) 2025 Anshler
+
+    Permission is hereby granted, free of charge, to any person obtaining
+    a copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions: [...]
+
+    The full MIT text is available in the V-JEPA 2 repository linked above.
+
+Note:  this permissive offer applies only to the original portions WHEN
+distributed separately from the GPL'd MOVAD code.  The combined work as a
+whole remains GPL v2.

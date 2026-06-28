@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Outputs / checkpoints
+output/
+checkpoints/
+*.pt
+*.pth
+*.pkl
+
+# Data
+data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Triton / torch compile
+triton/
+*.triton_cache/
+
+# Misc
+*.log
+.claude/settings.local.json
+bib_cache/
