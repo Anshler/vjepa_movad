@@ -706,6 +706,65 @@ class ClsVJEPA(nn.Module):
             nn.ModuleList([self.lin1, self.lin2, self.lin3, self.bn]),
         )
 
+    def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Run the frozen ViT over every NF-frame sliding window in one batch of videos.
+
+        Stacks all stride-1 clips into a mega-batch and encodes in a single
+        ``no_grad`` pass.  Memory scales with ``batch_size × VCL`` — keep VCL
+        reasonable to avoid OOM.
+
+        Returns ``[B, n_clips, N_patches, embed_dim]`` where ``n_clips = T - num_frames``.
+        """
+        B, C, T, H, W = x.shape
+        n_clips = T - num_frames
+
+        clips = []
+        for i in range(num_frames, T):
+            clips.append(x[:, :, i - num_frames:i, :, :])              # [B, C, NF, H, W]  (view)
+        mega_batch = torch.cat(clips, dim=0)                            # [B * n_clips, C, NF, H, W]
+
+        # N_patches = T_tokens × H_patches × W_patches  (deterministic from config)
+        enc = self.encoder.encoder
+        N_patches = (num_frames // enc.tubelet_size) * (H // enc.patch_size) * (W // enc.patch_size)
+
+        with torch.no_grad():
+            patches = self.encoder(mega_batch, return_patches=True)     # [B * n_clips, N_patches, embed_dim]
+
+        patches = patches.view(B, n_clips, N_patches, -1)               # [B, n_clips, N_patches, embed_dim]
+        return patches
+
+    def forward_temporal_step(
+        self, x: torch.Tensor, state: torch.Tensor | tuple | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple | None]:
+        """Single temporal step from pre-computed encoder output.
+
+        Args:
+            x:     For standard path: ``[B, embed_dim]`` (spatially mean-pooled).
+                   For slot path: ``[B, N_patches, embed_dim]`` (full patch tokens).
+            state: temporal-model state (MambaCache or LSTM tuple).
+
+        Returns:
+            output:    ``[B, 2]`` class logits.
+            new_state: updated temporal-model state.
+        """
+        if self._slot_based:
+            slots, new_state = self.temporal(x, state)
+            D = slots.shape[-1]
+            scores = (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)
+            attn = scores.softmax(dim=-1)
+            pooled = (attn.unsqueeze(-1) * slots).sum(dim=1)
+            return self.classifier(pooled), new_state
+
+        # Standard path: bn → lin1 → relu → temporal → lin2 → relu → lin3
+        x = self.bn(x)
+        x = F.relu(self.lin1(x))
+        x = self.drop(x)
+        x, new_state = self.temporal(x, state)
+        x = F.relu(self.lin2(x))
+        x = self.drop(x)
+        x = self.lin3(x)
+        return x, new_state
+
     def forward(self, x, state=None):
         if self._slot_based:
             patches = self.encoder(x, return_patches=True)    # [B, N, embed_dim]

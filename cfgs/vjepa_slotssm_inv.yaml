@@ -32,7 +32,7 @@ use_inverted_attention: true        # inverted cross-attn (reference repo defaul
 
 # --- Data -----------------------------------------------------------------
 NF: 4
-VCL: 128
+VCL: 32
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota

@@ -35,7 +35,7 @@ use_inverted_attention: false        # standard cross-attn (FlashMHA-compatible)
 
 # --- Data -----------------------------------------------------------------
 NF: 4
-VCL: 128
+VCL: 32
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota

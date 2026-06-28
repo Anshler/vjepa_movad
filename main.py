@@ -109,90 +109,116 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
     _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
     autocast_ctx = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
 
+    # -------------------------------------------------------------------
+    # Per-video temporal loop (extracted so pre-batched + standard paths
+    # can share it without duplication).
+    # -------------------------------------------------------------------
+    def _run_temporal_loop(
+        model, patches_clips, data_info,
+        fb, v_len,
+        cfg, criterion, optimizer, autocast_ctx,
+    ):
+        """Run stride-1 sliding-window temporal loop over one video batch.
+
+        ``patches_clips``:  ``[B, n_clips, embed_dim]``  (standard, mean-pooled)
+                          or ``[B, n_clips, N_patches, embed_dim]``  (slot-based).
+
+        Returns (avg_loss, frame_count, slot_diag, targets, outputs, index_loss).
+        """
+        toa_batch = data_info[:, 2]
+        tea_batch = data_info[:, 3]
+        video_len_orig = data_info[:, 0]
+
+        t_shape = (data_info.shape[0], v_len - fb)
+        targets = torch.full(t_shape, -100).to(data_info.device)
+        outputs_t = torch.full(t_shape, -100, dtype=torch.float).to(data_info.device)
+
+        state = None
+        slot_diag = {}
+        running_loss = 0.0
+        frame_count = 0
+        _idx_loss = 0
+
+        for i in range(fb, v_len):
+            target = gt_cls_target(i, toa_batch, tea_batch).long()
+
+            with autocast_ctx:
+                feat = patches_clips[:, i - fb, ...]                 # [B, embed_dim] or [B, N, embed_dim]
+                output, state = model.forward_temporal_step(feat, state)
+
+            flt = i >= video_len_orig
+            target[flt] = -100
+            output[flt] = -100
+
+            if cfg.get("apply_softmax", True):
+                output = output.softmax(dim=1)
+
+            optimizer.zero_grad()
+            loss = criterion(output, target)
+
+            # Entropy penalty for sparse SlotSSM
+            entropy_weight = cfg.get("entropy_weight", 0.0)
+            if entropy_weight > 0 and hasattr(model, "temporal") and hasattr(model.temporal, "_entropy"):
+                ent = model.temporal._entropy
+                if isinstance(ent, torch.Tensor) and ent.item() > 0:
+                    loss = loss + entropy_weight * (-ent)
+
+            # Slot cross-attn diagnostics (inverted only)
+            if hasattr(model, "temporal") and hasattr(model.temporal, "_slot_mass_min"):
+                _mass_min = model.temporal._slot_mass_min
+                if not (isinstance(_mass_min, torch.Tensor) and torch.isnan(_mass_min)):
+                    slot_diag["mass_min"] = min(slot_diag.get("mass_min", 999.0), float(_mass_min))
+                    slot_diag["mass_mean"] = slot_diag.get("mass_mean", 0.0) + float(model.temporal._slot_mass_mean)
+                    slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(model.temporal._slot_usage_frac))
+                    slot_diag["_count"] = slot_diag.get("_count", 0) + 1
+
+            loss.backward()
+            optimizer.step()
+
+            _idx_loss += 1
+            running_loss += loss.item()
+            frame_count += 1
+            targets[:, i - fb] = target.clone()
+            out = output.max(1)[1]
+            out[target == -100] = -100
+            outputs_t[:, i - fb] = out
+
+        return running_loss, frame_count, slot_diag, targets, outputs_t, _idx_loss
+
     model.train(True)
+    is_slot_based = model._slot_based
+
     for e in range(begin_epoch, cfg.epochs):
         epoch_total_loss = 0.0
         epoch_frames = 0
+
         pbar = tqdm(enumerate(traindata_loader), total=len(traindata_loader), desc=f"Epoch {e+1}/{cfg.epochs}")
-        for j, (video_data, data_info) in pbar:
+        for j, (video_data, data_info) in pbar:  # noqa: B007
             video_data = video_data.to(cfg.device, non_blocking=True)
             data_info = data_info.to(cfg.device, non_blocking=True)
-
-            # [B, F, C, W, H] -> [B, C, F, W, H]
-            video_data = torch.swapaxes(video_data, 1, 2)
-
-            t_shape = (video_data.shape[0], video_data.shape[2] - fb)
-            targets = torch.full(t_shape, -100).to(video_data.device)
-            outputs = torch.full(t_shape, -100, dtype=torch.float).to(video_data.device)
-
-            video_len_orig = data_info[:, 0]
-            toa_batch = data_info[:, 2]
-            tea_batch = data_info[:, 3]
+            video_data = torch.swapaxes(video_data, 1, 2)            # [B, C, F, H, W]
             v_len = video_data.shape[2]
 
-            state = None  # generic — model handles init per temporal_model type
+            # Pre-compute frozen encoder: [B, n_clips, N_patches, embed_dim]
+            patches = model.encode_video_clips(video_data, fb)
 
-            slot_diag = {}  # accumulated per-video, populated inside the frame loop
-            running_loss = 0.0  # accumulated per-video CE loss (for tqdm + TensorBoard)
-            frame_count = 0
+            if not is_slot_based:
+                # Standard path: spatially mean-pool → [B, n_clips, embed_dim]
+                patches = patches.mean(dim=2)
+            # Slot path: keep full patches [B, n_clips, N_patches, embed_dim]
 
-            for i in range(fb, v_len):
-                target = gt_cls_target(i, toa_batch, tea_batch).long()
-                x = video_data[:, :, i - fb : i]
+            # --- Temporal loop -----------------------------------------
+            running_loss, f_count, slot_diag, targets, outputs, dl = _run_temporal_loop(
+                model, patches, data_info,
+                fb, v_len,
+                cfg, criterion, optimizer, autocast_ctx,
+            )
+            index_loss += dl
 
-                with autocast_ctx:
-                    output, state = model(x, state)
-
-                flt = i >= video_len_orig
-                target[flt] = -100
-                output[flt] = -100
-
-                if cfg.get("apply_softmax", True):
-                    output = output.softmax(dim=1)
-
-                optimizer.zero_grad()
-                loss = criterion(output, target)
-
-                # Entropy penalty for sparse SlotSSM: prevent routing collapse
-                # (all traffic going to 1-2 slots).  Higher entropy = more
-                # uniform slot usage.  Only applies to sparse_slotssm models.
-                entropy_weight = cfg.get("entropy_weight", 0.0)
-                if entropy_weight > 0 and hasattr(model, "temporal") and hasattr(model.temporal, "_entropy"):
-                    ent = model.temporal._entropy
-                    if isinstance(ent, torch.Tensor) and ent.item() > 0:
-                        loss = loss + entropy_weight * (-ent)  # minimise negative entropy = maximise entropy
-
-                # --- Slot cross-attn diagnostics (inverted only) ------------
-                # Track per-slot mass from inverted cross-attention to detect
-                # dead slots (slots that never win patches in the softmax
-                # competition).  Only populated for slotssm / sparse_slotssm
-                # with use_inverted_attention=True; otherwise stays NaN.
-                if hasattr(model, "temporal") and hasattr(model.temporal, "_slot_mass_min"):
-                    _mass_min = model.temporal._slot_mass_min
-                    if not (isinstance(_mass_min, torch.Tensor) and torch.isnan(_mass_min)):
-                        # Track worst-case across frames within the video
-                        slot_diag["mass_min"] = min(slot_diag.get("mass_min", 999.0), float(_mass_min))
-                        slot_diag["mass_mean"] = slot_diag.get("mass_mean", 0.0) + float(model.temporal._slot_mass_mean)
-                        slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(model.temporal._slot_usage_frac))
-                        slot_diag["_count"] = slot_diag.get("_count", 0) + 1
-                # ---------------------------------------------------------------
-
-                loss.backward()
-                optimizer.step()
-
-                index_loss += 1
-                running_loss += loss.item()
-                frame_count += 1
-                targets[:, i - fb] = target.clone()
-                out = output.max(1)[1]
-                out[target == -100] = -100
-                outputs[:, i - fb] = out
-
-            # --- Per-video logging (tqdm + TensorBoard) --------------------
-            avg_loss = running_loss / max(frame_count, 1)
+            # --- Per-video logging -------------------------------------
+            avg_loss = running_loss / max(f_count, 1)
             writer.add_scalar("train/loss", avg_loss, index_guess)
 
-            # Build tqdm postfix: always show loss, add slot diag if present
             postfix_parts = [f"loss={avg_loss:.4f}"]
             if slot_diag:
                 n = slot_diag.pop("_count", 1)
@@ -207,7 +233,7 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
             pbar.set_postfix_str(" ".join(postfix_parts))
 
             epoch_total_loss += running_loss
-            epoch_frames += max(frame_count, 1)
+            epoch_frames += max(f_count, 1)
 
             outputs = outputs[outputs != -100]
             targets = targets[targets != -100]
@@ -267,14 +293,18 @@ def test(cfg, model, testdata_loader, epoch, filename):
         tea_batch = data_info[:, 3]
         info_batch = data_info[:, 7:11]
 
-        state = None
+        # Pre-compute frozen encoder: [1, n_clips, N_patches, embed_dim]
+        patches = model.encode_video_clips(video_data, fb)
+        if not model._slot_based:
+            patches = patches.mean(dim=2)  # spatial pool
 
+        state = None
         for i in range(fb, video_data.shape[2]):
             target = gt_cls_target(i, toa_batch, tea_batch).long()
-            x = video_data[:, :, i - fb : i]
 
             with autocast_ctx:
-                output, state = model(x, state)
+                feat = patches[:, i - fb, ...]
+                output, state = model.forward_temporal_step(feat, state)
 
             if cfg.get("apply_softmax", True):
                 output = output.softmax(dim=1)
