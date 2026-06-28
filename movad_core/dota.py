@@ -104,6 +104,15 @@ class Dota(Dataset):
         self._filter_wrong_metadata()
         self._load_anns()
 
+        # Cache sorted frame file lists — avoid os.listdir on every __getitem__
+        self._frame_files = {}
+        for key in self.keys:
+            frames_dir = os.path.join(self.root_path, 'frames', key, 'images')
+            self._frame_files[key] = sorted(os.listdir(frames_dir))
+
+        # Build video_name → index map — avoid O(n) keys.index() in gather_info
+        self._key_index = {key: idx for idx, key in enumerate(self.keys)}
+
     def _load_anns(self):
         self.keys = list(self.metadata.keys())
         self.annotations = []
@@ -168,13 +177,12 @@ class Dota(Dataset):
 
         frames_dir = os.path.join(
             self.root_path, 'frames', video_file, 'images')
-        frames = []
         names = []
-        frames = sorted(os.listdir(frames_dir))
-        for index, name in enumerate(frames[sub_batch.begin:sub_batch.end]):
+        frame_files = self._frame_files[video_file]
+        for idx, name in enumerate(frame_files[sub_batch.begin:sub_batch.end]):
             # filter accident frames if it is a negative example
-            if label == 1 or index < sub_batch.a_start or \
-                    index > sub_batch.a_end:
+            if label == 1 or idx < sub_batch.a_start or \
+                    idx > sub_batch.a_end:
                 path = os.path.join(frames_dir, name)
                 names.append(path)
         frames = np.array(list(map(read_file, names)))
@@ -187,7 +195,7 @@ class Dota(Dataset):
         label = sub_batch.label
         return np.array([
             video_len_orig,
-            self.keys.index(ann['video_name']),
+            self._key_index[ann['video_name']],
             sub_batch.a_start,
             sub_batch.a_end,
             label,

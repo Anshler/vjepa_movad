@@ -1,34 +1,34 @@
 # --------------------------------------------------------------------
-# V-JEPA 2.1 + MOVAD — supervised anomaly detection (LSTM baseline)
-#
-# Frozen V-JEPA 2.1 ViT-L encoder + 3-layer LSTM + binary classifier.
-# Identical to original MOVAD's temporal architecture; only the
-# backbone changes (V-JEPA ViT replaces Video Swin Transformer).
+# Minimal smoke-test config — ViT-B/256 encoder + Mamba
+# Matches vjepa2_1_vitb_dist_vitG_384.pt checkpoint
 # --------------------------------------------------------------------
 
 # --- V-JEPA 2.1 encoder ---------------------------------------------------
-model_name: vit_large
+model_name: vit_base
 img_size: 256
 num_frames: 4
 tubelet_size: 2
 patch_size: 16
-checkpoint_path: null
+checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
 checkpoint_key: ema_encoder
 pool: mean
 
 # --- Temporal model -------------------------------------------------------
-temporal_model: lstm                 # "lstm" | "mamba" | "slotssm" | "sparse_slotssm"
-dim_latent: 1024
+temporal_model: mamba
+dim_latent: 768
 dropout: 0.3
-rnn_state_size: 1024
-rnn_cell_num: 3
+rnn_cell_num: 3                     # number of Mamba blocks
+mamba_d_state: 128
+mamba_d_conv: 4
+mamba_expand: 2
+mamba_version: mamba2
 
 # --- Data -----------------------------------------------------------------
 NF: 4
 VCL: 128
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
-data_path: ./data/dota
+data_path: /mnt/d/Users/Chrysenberg69420/Downloads/DoTA_seg
 data_std: [0.5, 0.5, 0.5]
 dataset: Dota
 image_shape: [720, 1280]
@@ -38,15 +38,15 @@ FPS: 10
 # --- Training -------------------------------------------------------------
 batch_size: 8
 class_weights: [0.3, 0.7]
-epochs: 200
+epochs: 2
 lr: 0.001
-snapshot_interval: 10
+snapshot_interval: 1
 num_workers: 4
-amp_dtype: bf16                      # bf16 (AMP mixed-precision), fp16, or fp32 (no AMP)
+amp_dtype: bf16
 
 # --- Augmentation ---------------------------------------------------------
-horizontal_flip_prob: 0.5
+horizontal_flip_prob: 0.0
 vertical_flip_prob: 0.0
 
 # --- Output ---------------------------------------------------------------
-output: ./output/vjepa_lstm
+output: ./output/test_run

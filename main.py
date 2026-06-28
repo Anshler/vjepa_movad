@@ -39,6 +39,14 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+# Compatibility: torchvision >=0.20 moved functional_tensor to _functional_tensor
+# pytorchvideo 0.1.5 still imports the old path.
+try:
+    import torchvision.transforms._functional_tensor as _ft
+    sys.modules.setdefault("torchvision.transforms.functional_tensor", _ft)
+except ImportError:
+    pass
+
 from movad_core.dota import Dota, gt_cls_target, setup_dota
 from movad_core.losses import build_loss
 from movad_core.metrics import evaluation, print_results
@@ -103,6 +111,8 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
 
     model.train(True)
     for e in range(begin_epoch, cfg.epochs):
+        epoch_total_loss = 0.0
+        epoch_frames = 0
         pbar = tqdm(enumerate(traindata_loader), total=len(traindata_loader), desc=f"Epoch {e+1}/{cfg.epochs}")
         for j, (video_data, data_info) in pbar:
             video_data = video_data.to(cfg.device, non_blocking=True)
@@ -123,6 +133,8 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
             state = None  # generic — model handles init per temporal_model type
 
             slot_diag = {}  # accumulated per-video, populated inside the frame loop
+            running_loss = 0.0  # accumulated per-video CE loss (for tqdm + TensorBoard)
+            frame_count = 0
 
             for i in range(fb, v_len):
                 target = gt_cls_target(i, toa_batch, tea_batch).long()
@@ -169,27 +181,41 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
                 optimizer.step()
 
                 index_loss += 1
+                running_loss += loss.item()
+                frame_count += 1
                 targets[:, i - fb] = target.clone()
                 out = output.max(1)[1]
                 out[target == -100] = -100
                 outputs[:, i - fb] = out
 
-            # Per-video slot diagnostics — log worst-case across all frames
+            # --- Per-video logging (tqdm + TensorBoard) --------------------
+            avg_loss = running_loss / max(frame_count, 1)
+            writer.add_scalar("train/loss", avg_loss, index_guess)
+
+            # Build tqdm postfix: always show loss, add slot diag if present
+            postfix_parts = [f"loss={avg_loss:.4f}"]
             if slot_diag:
                 n = slot_diag.pop("_count", 1)
                 writer.add_scalar("slots/mass_min", slot_diag["mass_min"], index_guess)
                 writer.add_scalar("slots/mass_mean", slot_diag["mass_mean"] / n, index_guess)
                 writer.add_scalar("slots/usage_frac", slot_diag["usage_frac"], index_guess)
-                pbar.set_postfix_str(
-                    f"loss={slot_diag['mass_min']:.3f} "
-                    f"mass_min={slot_diag['mass_min']:.4f} "
-                    f"mass_avg={slot_diag['mass_mean']/n:.4f} "
-                    f"use={slot_diag['usage_frac']:.2f}"
-                )
+                postfix_parts.extend([
+                    f"mass_min={slot_diag['mass_min']:.4f}",
+                    f"mass_avg={slot_diag['mass_mean']/n:.4f}",
+                    f"use={slot_diag['usage_frac']:.2f}",
+                ])
+            pbar.set_postfix_str(" ".join(postfix_parts))
+
+            epoch_total_loss += running_loss
+            epoch_frames += max(frame_count, 1)
 
             outputs = outputs[outputs != -100]
             targets = targets[targets != -100]
             index_guess += 1
+
+        epoch_avg_loss = epoch_total_loss / max(epoch_frames, 1)
+        writer.add_scalar("train/epoch_loss", epoch_avg_loss, e)
+        print(f"  Epoch {e+1}/{cfg.epochs} avg loss: {epoch_avg_loss:.4f}  ({epoch_frames} frames in {epoch_total_loss:.1f} total)")
 
         if lr_scheduler is not None:
             lr_scheduler.step()

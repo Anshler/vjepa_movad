@@ -79,47 +79,55 @@ Encoder: `model_name` (vit_base/vit_large/vit_giant_xformers), `num_frames`, `im
 
 ## Commands
 
+**Always run via WSL** with the `vjepa2-312` conda environment. The project lives on the Windows filesystem (`/mnt/d/...`) but all execution happens in WSL.
+
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase train --epochs 200'
+```
+
+For shorter inline commands, use the Bash tool directly (the harness routes it through WSL automatically when in a WSL directory).
+
 ### Training
 
 ```bash
-python main.py --config cfgs/vjepa_v1.yaml --phase train --epochs 200
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase train --epochs 200'
 ```
 
 Resume from checkpoint:
 ```bash
-python main.py --config cfgs/vjepa_v1.yaml --phase train --epoch 50
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase train --epoch 50'
 ```
 
 ### Testing / evaluation
 
 ```bash
-python main.py --config cfgs/vjepa_v1.yaml --phase test --epoch 190
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase test --epoch 190'
 ```
 
 ### Smoke tests (all 6 temporal variants + resolution flexibility)
 
 ```bash
-python tests/test_inference.py
-python tests/test_inference.py --amp fp16
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python tests/test_inference.py'
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python tests/test_inference.py --amp fp16'
 ```
 
 ### Latency benchmarking
 
 ```bash
-python tests/benchmark_latency.py
-python tests/benchmark_latency.py --amp fp32
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python tests/benchmark_latency.py'
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python tests/benchmark_latency.py --amp fp32'
 ```
 
 ### Encoder-only optimization benchmarks
 
 ```bash
-python tests/bench_encoder_opts.py
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python tests/bench_encoder_opts.py'
 ```
 
 ### Sparse Mamba correctness test
 
 ```bash
-python tests/test_sparse_mamba.py
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python tests/test_sparse_mamba.py'
 ```
 
 ## Dependencies

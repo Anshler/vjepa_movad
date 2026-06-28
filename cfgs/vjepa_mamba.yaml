@@ -27,7 +27,7 @@ mamba_version: mamba2               # Mamba2 (default in SlotSSM repo)
 
 # --- Data -----------------------------------------------------------------
 NF: 4
-VCL: null
+VCL: 128
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota
@@ -43,7 +43,7 @@ class_weights: [0.3, 0.7]
 epochs: 200
 lr: 0.001
 snapshot_interval: 10
-num_workers: 0
+num_workers: 4
 amp_dtype: bf16                      # bf16 (AMP mixed-precision), fp16, or fp32 (no AMP)
 
 # --- Augmentation ---------------------------------------------------------
