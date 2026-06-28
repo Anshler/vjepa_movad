@@ -116,14 +116,14 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
     def _run_temporal_loop(
         model, patches_clips, data_info,
         fb, v_len,
-        cfg, criterion, optimizer, autocast_ctx,
+        cfg, criterion, autocast_ctx,
     ):
         """Run stride-1 sliding-window temporal loop over one video batch.
 
-        ``patches_clips``:  ``[B, n_clips, embed_dim]``  (standard, mean-pooled)
-                          or ``[B, n_clips, N_patches, embed_dim]``  (slot-based).
-
-        Returns (avg_loss, frame_count, slot_diag, targets, outputs, index_loss).
+        Returns (total_loss, frame_count, slot_diag, targets, outputs).
+        ``total_loss`` is a scalar tensor ready for ``.backward()``.
+        ``optimizer.zero_grad()`` + ``loss.backward()`` + ``optimizer.step()``
+        are done ONCE per video by the caller, not per frame.
         """
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
@@ -135,9 +135,8 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
 
         state = None
         slot_diag = {}
-        running_loss = 0.0
+        total_loss = torch.tensor(0.0, device=data_info.device)
         frame_count = 0
-        _idx_loss = 0
 
         for i in range(fb, v_len):
             target = gt_cls_target(i, toa_batch, tea_batch).long()
@@ -153,7 +152,6 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
             if cfg.get("apply_softmax", True):
                 output = output.softmax(dim=1)
 
-            optimizer.zero_grad()
             loss = criterion(output, target)
 
             # Entropy penalty for sparse SlotSSM
@@ -172,18 +170,14 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
                     slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(model.temporal._slot_usage_frac))
                     slot_diag["_count"] = slot_diag.get("_count", 0) + 1
 
-            loss.backward()
-            optimizer.step()
-
-            _idx_loss += 1
-            running_loss += loss.item()
+            total_loss = total_loss + loss
             frame_count += 1
             targets[:, i - fb] = target.clone()
             out = output.max(1)[1]
             out[target == -100] = -100
             outputs_t[:, i - fb] = out
 
-        return running_loss, frame_count, slot_diag, targets, outputs_t, _idx_loss
+        return total_loss, frame_count, slot_diag, targets, outputs_t
 
     model.train(True)
     is_slot_based = model._slot_based
@@ -192,12 +186,24 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
         epoch_total_loss = 0.0
         epoch_frames = 0
 
-        pbar = tqdm(enumerate(traindata_loader), total=len(traindata_loader), desc=f"Epoch {e+1}/{cfg.epochs}")
-        for j, (video_data, data_info) in pbar:  # noqa: B007
-            video_data = video_data.to(cfg.device, non_blocking=True)
-            data_info = data_info.to(cfg.device, non_blocking=True)
+        loader_iter = iter(traindata_loader)
+
+        # --- First batch: load synchronously (no previous batch to prefetch) ---
+        video_data, data_info = next(loader_iter)
+        video_data = video_data.to(cfg.device, non_blocking=True)
+        data_info = data_info.to(cfg.device, non_blocking=True)
+
+        n_batches = len(traindata_loader)
+        pbar = tqdm(range(n_batches), desc=f"Epoch {e+1}/{cfg.epochs}")
+        for j in pbar:
             video_data = torch.swapaxes(video_data, 1, 2)            # [B, C, F, H, W]
             v_len = video_data.shape[2]
+
+            # --- Prefetch next batch to GPU while encoding runs ---------
+            if j < n_batches - 1:
+                next_video, next_info = next(loader_iter)
+                next_video = next_video.to(cfg.device, non_blocking=True)
+                next_info = next_info.to(cfg.device, non_blocking=True)
 
             # Pre-compute frozen encoder: [B, n_clips, N_patches, embed_dim]
             patches = model.encode_video_clips(video_data, fb)
@@ -208,15 +214,19 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
             # Slot path: keep full patches [B, n_clips, N_patches, embed_dim]
 
             # --- Temporal loop -----------------------------------------
-            running_loss, f_count, slot_diag, targets, outputs, dl = _run_temporal_loop(
+            total_loss, f_count, slot_diag, targets, outputs = _run_temporal_loop(
                 model, patches, data_info,
                 fb, v_len,
-                cfg, criterion, optimizer, autocast_ctx,
+                cfg, criterion, autocast_ctx,
             )
-            index_loss += dl
+
+            # Single backward + step per video (fuses 28 micro-operations)
+            optimizer.zero_grad()
+            total_loss.backward()
+            optimizer.step()
 
             # --- Per-video logging -------------------------------------
-            avg_loss = running_loss / max(f_count, 1)
+            avg_loss = total_loss.item() / max(f_count, 1)
             writer.add_scalar("train/loss", avg_loss, index_guess)
 
             postfix_parts = [f"loss={avg_loss:.4f}"]
@@ -232,12 +242,17 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
                 ])
             pbar.set_postfix_str(" ".join(postfix_parts))
 
-            epoch_total_loss += running_loss
+            epoch_total_loss += total_loss.item()
             epoch_frames += max(f_count, 1)
 
             outputs = outputs[outputs != -100]
             targets = targets[targets != -100]
             index_guess += 1
+
+            # Rotate to next batch (already on GPU from prefetch)
+            if j < n_batches - 1:
+                video_data = next_video
+                data_info = next_info
 
         epoch_avg_loss = epoch_total_loss / max(epoch_frames, 1)
         writer.add_scalar("train/epoch_loss", epoch_avg_loss, e)

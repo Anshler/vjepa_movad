@@ -25,7 +25,7 @@ mamba_version: mamba2
 
 # --- Data -----------------------------------------------------------------
 NF: 4
-VCL: 32
+VCL: 16
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
 data_path: /mnt/d/Users/Chrysenberg69420/Downloads/DoTA_seg
