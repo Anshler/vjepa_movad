@@ -166,6 +166,74 @@ for frames, res, tag in [(16, 256, "16f@256"), (32, 256, "32f@256"), (16, 384, "
         out, _ = model_lstm(x)
     print(f"  {tag}: {tuple(x.shape)} -> {tuple(out.shape)}  ✓")
 
+# ===========================================================================
+# Multi-head smoke test — one encoder, multiple temporal models
+# ===========================================================================
+print("\n" + "=" * 70)
+print("Multi-head — shared encoder, multiple temporal models")
+print("=" * 70)
+
+if _HAS_MAMBA_SSM and _HAS_CKPT:
+    from model import build_multi_head_vjepa
+
+    # Build a multi-head cfg combining 6 existing configs
+    head_files = [
+        "vjepa_v1.yaml",          # LSTM
+        "vjepa_mamba.yaml",       # Mamba
+        "vjepa_slotssm.yaml",    # SlotSSM
+        "vjepa_sparse_slotssm.yaml",  # Sparse SlotSSM
+        "vjepa_slotssm_inv.yaml",     # SlotSSM (inverted)
+        "vjepa_sparse_slotssm_inv.yaml",  # Sparse SlotSSM (inverted)
+    ]
+    head_names = [os.path.splitext(f)[0] for f in head_files]
+
+    all_cfgs = []
+    for fpath in head_files:
+        with open(os.path.join(CFG_DIR, fpath), "r") as f:
+            all_cfgs.append(EasyDict(yaml.safe_load(f)))
+
+    # Master = first config
+    cfg_multi = all_cfgs[0]
+    cfg_multi.device = DEVICE
+    if _HAS_CKPT:
+        cfg_multi.checkpoint_path = _VJEPA2_CKPT
+
+    cfg_multi._head_cfgs_flat = [
+        {**dict(hc), "name": hn} for hc, hn in zip(all_cfgs, head_names)
+    ]
+
+    model_multi = build_multi_head_vjepa(cfg_multi)
+    model_multi.eval()
+
+    print(f"\n  Heads: {list(model_multi.heads.keys())}")
+
+    # Test: encode once → each head processes independently (streaming)
+    shape = (2, 3, cfg_multi.num_frames, cfg_multi.img_size, cfg_multi.img_size)
+    x = torch.randn(*shape).to(DEVICE)
+    for name, head in model_multi.heads.items():
+        state = None
+        for step in range(3):
+            with torch.no_grad(), _autocast():
+                logits, state = head(x, state)
+            prob = logits.softmax(dim=1)[0, 1].item()
+            if step == 0:
+                print(f"  [{name}] step 1: anomaly_prob={prob:.4f}")
+        print(f"    ✓ {name} streaming OK (3 steps)")
+
+    # Test: encode_video_clips shared path
+    video = torch.randn(2, 3, 16, cfg_multi.img_size, cfg_multi.img_size).to(DEVICE)
+    with torch.no_grad():
+        patches = model_multi.encode_video_clips(video, 4)
+    print(f"\n  encode_video_clips: {tuple(patches.shape)}")
+    print(f"    ✓ shared encode OK")
+
+    print("\n  All 6 heads pass streaming smoke tests ✓")
+else:
+    if not _HAS_MAMBA_SSM:
+        print("  (skipped — mamba_ssm not installed)")
+    if not _HAS_CKPT:
+        print("  (skipped — checkpoint not found)")
+
 print("\n" + "=" * 70)
 print("All config-based smoke tests passed!")
 print("=" * 70)

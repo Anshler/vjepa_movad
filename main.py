@@ -52,29 +52,78 @@ from movad_core.losses import build_loss
 from movad_core.metrics import evaluation, print_results
 from movad_core.optim import build_optimizer
 from movad_core import utils as movad_utils
-from model import build_cls_vjepa
+from model import build_multi_head_vjepa
 
 
 # ---------------------------------------------------------------------------
 # CLI
+#
+# Single-model (backward-compatible):
+#   python main.py --config cfgs/vjepa_v1.yaml --phase train
+#
+# Multi-head (one encoder → multiple temporal models):
+#   python main.py --config cfgs/vjepa_v1.yaml cfgs/vjepa_mamba.yaml cfgs/vjepa_slotssm.yaml --phase train
+#
+# The first config is the *master* — its encoder, data, training, augmentation,
+# and output sections are shared.  Each config contributes its temporal-model
+# variant as an independent head.  Head name = config basename minus ``.yaml``.
 # ---------------------------------------------------------------------------
 def parse_configs():
     parser = argparse.ArgumentParser(description="V-JEPA 2.1 + MOVAD anomaly detection")
-    parser.add_argument("--config", default="cfgs/vjepa_v1.yaml", help="YAML config file")
+    _DEFAULT_CONFIGS = [
+        #"cfgs/vjepa_v1.yaml",
+        "cfgs/vjepa_mamba.yaml",
+        "cfgs/vjepa_slotssm.yaml",
+        "cfgs/vjepa_sparse_slotssm.yaml",
+        #"cfgs/vjepa_slotssm_inv.yaml",
+        #"cfgs/vjepa_sparse_slotssm_inv.yaml",
+    ]
+    parser.add_argument("--config", nargs="+", default=_DEFAULT_CONFIGS,
+                        help="YAML config(s). First = master (encoder/data/training/...); "
+                             "rest = temporal-model heads reusing the master's shared settings.")
     parser.add_argument("--phase", default="train", choices=["train", "test"], help="train or test")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--snapshot_interval", type=int, default=10)
     parser.add_argument("--epoch", type=int, default=-1, help="Resume from (train) or eval (test)")
-    parser.add_argument("--output", default="./output/vjepa_v1", help="Output directory")
+    parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
     args = parser.parse_args()
 
-    with open(args.config, "r") as f:
-        cfg = EasyDict(yaml.safe_load(f))
+    # Load all configs
+    all_cfgs = []
+    for path in args.config:
+        with open(path, "r") as f:
+            all_cfgs.append(EasyDict(yaml.safe_load(f)))
+
+    # Master config = first one
+    cfg = all_cfgs[0]
+
+    # Derive output from master config before CLI args clobber it
+    _yaml_output = cfg.get("output", "./output/vjepa_v1")
+    _yaml_workers = cfg.get("num_workers", 0)
+
     cfg.update(vars(args))
 
+    if cfg.output is None:
+        cfg.output = _yaml_output
+    # Keep YAML num_workers unless explicitly overridden via CLI
+    if args.num_workers == 0 and _yaml_workers > 0:
+        cfg.num_workers = _yaml_workers
+
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Build head configs — always, even for 1 head
+    import pathlib
+
+    cfg._head_names = [pathlib.Path(p).stem for p in args.config]
+    head_cfgs_flat = []
+    for name, hc in zip(cfg._head_names, all_cfgs):
+        entry = dict(hc)
+        entry["name"] = name
+        head_cfgs_flat.append(entry)
+    cfg._head_cfgs_flat = head_cfgs_flat
+
     return cfg
 
 
@@ -89,42 +138,78 @@ def set_deterministic(seed: int):
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training loop — one encode → N independent temporal trainings
+#
+# Works for 1 head or N heads — same code path either way.
+# Each head has its own optimizer, checkpoint directory, and TensorBoard
+# writer.  Losses are never summed — ``.backward()`` flows only through that
+# head's temporal + classifier parameters.  The shared encoder is frozen.
 # ---------------------------------------------------------------------------
-def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
-    writer = SummaryWriter(
-        os.path.join(cfg.output, "tensorboard", f"train_{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}")
-    )
-    os.makedirs(os.path.join(cfg.output, "checkpoints"), exist_ok=True)
-    with open(os.path.join(cfg.output, "cfg.yml"), "w") as f:
-        yaml.dump(dict(cfg), f, default_flow_style=False)
+def train(cfg, model, traindata_loader, begin_epoch):
+    """Train a MultiHeadVJEPA: encode once per batch, then loop heads sequentially.
 
-    criterion = build_loss(cfg)
-    fb = cfg.NF
-
-    index_guess = 0
-    index_loss = 0
-
-    _amp_cfg = cfg.get("amp_dtype", "fp32")
-    _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
-    autocast_ctx = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
+    Heads are trained **independently** — different losses, different
+    optimizers, different checkpoints.  Each head's ``.backward()`` only
+    touches that head's parameters.
+    """
+    head_names = list(model.heads.keys())
 
     # -------------------------------------------------------------------
-    # Per-video temporal loop (extracted so pre-batched + standard paths
-    # can share it without duplication).
+    # Per-head infrastructure
     # -------------------------------------------------------------------
-    def _run_temporal_loop(
-        model, patches_clips, data_info,
-        fb, v_len,
-        cfg, criterion, autocast_ctx,
-    ):
-        """Run stride-1 sliding-window temporal loop over one video batch.
+    head_cfgs: dict[str, dict] = {}
+    criterion: dict[str, torch.nn.Module] = {}
+    optimizer: dict[str, torch.optim.Optimizer] = {}
+    writers: dict[str, SummaryWriter] = {}
+    output_dirs: dict[str, str] = {}
+    accum_steps: dict[str, int] = {}
+    autocast_ctx: dict[str, object] = {}
 
-        Returns (total_loss, frame_count, slot_diag, targets, outputs).
-        ``total_loss`` is a scalar tensor ready for ``.backward()``.
-        ``optimizer.zero_grad()`` + ``loss.backward()`` + ``optimizer.step()``
-        are done ONCE per video by the caller, not per frame.
-        """
+    for name in head_names:
+        hc = model.head_configs.get(name, {})
+        head_cfgs[name] = dict(cfg)
+        for k in ("dim_latent", "dropout", "rnn_state_size", "rnn_cell_num",
+                   "mamba_d_state", "mamba_d_conv", "mamba_expand", "mamba_version",
+                   "num_slots", "slot_dim", "num_ssm_blocks", "top_k", "eps_random",
+                   "use_inverted_attention", "entropy_weight"):
+            if k in hc:
+                head_cfgs[name][k] = hc[k]
+
+        output_dir = hc.get("output", os.path.join(cfg.output, name))
+        output_dirs[name] = output_dir
+        os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
+        with open(os.path.join(output_dir, "cfg.yml"), "w") as f:
+            yaml.dump(head_cfgs[name], f, default_flow_style=False)
+
+        writer = SummaryWriter(
+            os.path.join(output_dir, "tensorboard", f"train_{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}")
+        )
+        writers[name] = writer
+
+        # Build head-specific loss
+        head_easy = EasyDict(head_cfgs[name])
+        head_easy.device = cfg.device
+        criterion[name] = build_loss(head_easy)
+
+        # Build head-specific optimizer (only head params, not shared encoder)
+        opt, _ = build_optimizer(
+            EasyDict({"lr": cfg.lr}),
+            model.heads[name],
+            None,
+        )
+        optimizer[name] = opt
+
+        _amp_cfg = head_cfgs[name].get("amp_dtype", "fp32")
+        _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
+        autocast_ctx[name] = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
+        accum_steps[name] = head_cfgs[name].get("grad_accum", 1)
+
+    # -------------------------------------------------------------------
+    # Per-video temporal loop — identical to single-model version but
+    # parameterised by head name so slot diagnostics route to the right
+    # TensorBoard writer.
+    # -------------------------------------------------------------------
+    def _run_temporal_loop(head, patches_clips, data_info, fb, v_len, head_name):
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         video_len_orig = data_info[:, 0]
@@ -141,33 +226,31 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
         for i in range(fb, v_len):
             target = gt_cls_target(i, toa_batch, tea_batch).long()
 
-            with autocast_ctx:
-                feat = patches_clips[:, i - fb, ...]                 # [B, embed_dim] or [B, N, embed_dim]
-                output, state = model.forward_temporal_step(feat, state)
+            with autocast_ctx[head_name]:
+                feat = patches_clips[:, i - fb, ...]
+                output, state = head.forward_temporal_step(feat, state)
 
             flt = i >= video_len_orig
             target[flt] = -100
             output[flt] = -100
 
-            if cfg.get("apply_softmax", True):
+            if head_cfgs[head_name].get("apply_softmax", True):
                 output = output.softmax(dim=1)
 
-            loss = criterion(output, target)
+            loss = criterion[head_name](output, target)
 
-            # Entropy penalty for sparse SlotSSM
-            entropy_weight = cfg.get("entropy_weight", 0.0)
-            if entropy_weight > 0 and hasattr(model, "temporal") and hasattr(model.temporal, "_entropy"):
-                ent = model.temporal._entropy
+            entropy_weight = head_cfgs[head_name].get("entropy_weight", 0.0)
+            if entropy_weight > 0 and hasattr(head, "temporal") and hasattr(head.temporal, "_entropy"):
+                ent = head.temporal._entropy
                 if isinstance(ent, torch.Tensor) and ent.item() > 0:
                     loss = loss + entropy_weight * (-ent)
 
-            # Slot cross-attn diagnostics (inverted only)
-            if hasattr(model, "temporal") and hasattr(model.temporal, "_slot_mass_min"):
-                _mass_min = model.temporal._slot_mass_min
+            if hasattr(head, "temporal") and hasattr(head.temporal, "_slot_mass_min"):
+                _mass_min = head.temporal._slot_mass_min
                 if not (isinstance(_mass_min, torch.Tensor) and torch.isnan(_mass_min)):
                     slot_diag["mass_min"] = min(slot_diag.get("mass_min", 999.0), float(_mass_min))
-                    slot_diag["mass_mean"] = slot_diag.get("mass_mean", 0.0) + float(model.temporal._slot_mass_mean)
-                    slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(model.temporal._slot_usage_frac))
+                    slot_diag["mass_mean"] = slot_diag.get("mass_mean", 0.0) + float(head.temporal._slot_mass_mean)
+                    slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(head.temporal._slot_usage_frac))
                     slot_diag["_count"] = slot_diag.get("_count", 0) + 1
 
             total_loss = total_loss + loss
@@ -179,188 +262,196 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
 
         return total_loss, frame_count, slot_diag, targets, outputs_t
 
+    # -------------------------------------------------------------------
+    # Epoch loop
+    # -------------------------------------------------------------------
     model.train(True)
-    is_slot_based = model._slot_based
-    accum_steps = cfg.get("grad_accum", 1)
+    accum_losses: dict[str, torch.Tensor] = {}
+    for name in head_names:
+        accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
     for e in range(begin_epoch, cfg.epochs):
-        epoch_total_loss = 0.0
-        epoch_frames = 0
+        epoch_losses = {n: 0.0 for n in head_names}
+        epoch_frames = {n: 0 for n in head_names}
 
         loader_iter = iter(traindata_loader)
 
-        # --- First batch: load synchronously ---
         video_data, data_info = next(loader_iter)
         video_data = video_data.to(cfg.device, non_blocking=True)
         data_info = data_info.to(cfg.device, non_blocking=True)
 
         n_batches = len(traindata_loader)
         pbar = tqdm(range(n_batches), desc=f"Epoch {e+1}/{cfg.epochs}")
-        accum_loss = torch.tensor(0.0, device=cfg.device)
+        global_idx = 0
+
         for j in pbar:
-            video_data = torch.swapaxes(video_data, 1, 2)            # [B, C, F, H, W]
+            video_data = torch.swapaxes(video_data, 1, 2)
             v_len = video_data.shape[2]
 
-            # --- Prefetch next batch to GPU while encoding runs ---------
             if j < n_batches - 1:
                 next_video, next_info = next(loader_iter)
                 next_video = next_video.to(cfg.device, non_blocking=True)
                 next_info = next_info.to(cfg.device, non_blocking=True)
 
-            # Pre-compute frozen encoder: [B, n_clips, N_patches, embed_dim]
-            patches = model.encode_video_clips(video_data, fb)
+            # Encoder runs ONCE for all heads
+            patches = model.encode_video_clips(video_data, cfg.NF)
 
-            if not is_slot_based:
-                # Standard path: spatially mean-pool → [B, n_clips, embed_dim]
-                patches = patches.mean(dim=2)
-            # Slot path: keep full patches [B, n_clips, N_patches, embed_dim]
+            # Train each head sequentially — independent forward + backward
+            postfix_parts = []
+            for name in head_names:
+                head = model.heads[name]
+                is_slot = head._slot_based
 
-            # --- Temporal loop -----------------------------------------
-            total_loss, f_count, slot_diag, targets, outputs = _run_temporal_loop(
-                model, patches, data_info,
-                fb, v_len,
-                cfg, criterion, autocast_ctx,
-            )
+                patches_in = patches if is_slot else patches.mean(dim=2)
 
-            epoch_total_loss += total_loss.item()
-            epoch_frames += max(f_count, 1)
+                total_loss, f_count, slot_diag, _, _ = _run_temporal_loop(
+                    head, patches_in, data_info, cfg.NF, v_len, name,
+                )
 
-            # Accumulate gradient (divide so grad_accum=N means average over N batches)
-            accum_loss = accum_loss + (total_loss / accum_steps)
+                epoch_losses[name] += total_loss.item()
+                epoch_frames[name] += max(f_count, 1)
 
-            step_now = ((j + 1) % accum_steps == 0) or (j == n_batches - 1)
-            if step_now:
-                optimizer.zero_grad()
-                accum_loss.backward()
-                optimizer.step()
-                accum_loss = torch.tensor(0.0, device=cfg.device)
+                accum_losses[name] = accum_losses[name] + (total_loss / accum_steps[name])
 
-            # --- Per-video logging -------------------------------------
-            avg_loss = total_loss.item() / max(f_count, 1)
-            writer.add_scalar("train/loss", avg_loss, index_guess)
+                step_now = ((j + 1) % accum_steps[name] == 0) or (j == n_batches - 1)
+                if step_now:
+                    optimizer[name].zero_grad()
+                    accum_losses[name].backward()
+                    optimizer[name].step()
+                    accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
-            postfix_parts = [f"loss={avg_loss:.4f}"]
-            if slot_diag:
-                n = slot_diag.pop("_count", 1)
-                writer.add_scalar("slots/mass_min", slot_diag["mass_min"], index_guess)
-                writer.add_scalar("slots/mass_mean", slot_diag["mass_mean"] / n, index_guess)
-                writer.add_scalar("slots/usage_frac", slot_diag["usage_frac"], index_guess)
-                postfix_parts.extend([
-                    f"mass_min={slot_diag['mass_min']:.4f}",
-                    f"mass_avg={slot_diag['mass_mean']/n:.4f}",
-                    f"use={slot_diag['usage_frac']:.2f}",
-                ])
+                avg_loss = total_loss.item() / max(f_count, 1)
+                writers[name].add_scalar("train/loss_step", avg_loss, global_idx)
+                postfix_parts.append(f"{name}:{avg_loss:.3f}")
+
+                if slot_diag:
+                    n = slot_diag.pop("_count", 1)
+                    writers[name].add_scalar("slots/mass_min", slot_diag["mass_min"], global_idx)
+                    writers[name].add_scalar("slots/mass_mean", slot_diag["mass_mean"] / n, global_idx)
+                    writers[name].add_scalar("slots/usage_frac", slot_diag["usage_frac"], global_idx)
+
             pbar.set_postfix_str(" ".join(postfix_parts))
+            global_idx += 1
 
-            epoch_total_loss += total_loss.item()
-            epoch_frames += max(f_count, 1)
-
-            outputs = outputs[outputs != -100]
-            targets = targets[targets != -100]
-            index_guess += 1
-
-            # Rotate to next batch (already on GPU from prefetch)
             if j < n_batches - 1:
                 video_data = next_video
                 data_info = next_info
 
-        epoch_avg_loss = epoch_total_loss / max(epoch_frames, 1)
-        writer.add_scalar("train/epoch_loss", epoch_avg_loss, e)
-        print(f"  Epoch {e+1}/{cfg.epochs} avg loss: {epoch_avg_loss:.4f}  ({epoch_frames} frames in {epoch_total_loss:.1f} total)")
+        # End-of-epoch logging
+        print(f"  Epoch {e+1}/{cfg.epochs}")
+        for name in head_names:
+            e_loss = epoch_losses[name] / max(epoch_frames[name], 1)
+            writers[name].add_scalar("train/epoch_loss", e_loss, e)
+            print(f"    {name}: avg_loss={e_loss:.4f}  ({epoch_frames[name]} frames)")
 
-        if lr_scheduler is not None:
-            lr_scheduler.step()
-
+        # Checkpoint
         if (e + 1) % cfg.snapshot_interval == 0:
-            ckpt_path = os.path.join(cfg.output, "checkpoints", f"model-{e+1:02d}.pt")
-            torch.save(
-                {
-                    "epoch": e,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "lr_scheduler_state_dict": lr_scheduler.state_dict() if lr_scheduler else None,
-                    "index_guess": index_guess,
-                    "index_loss": index_loss,
-                },
-                ckpt_path,
-            )
-            print(f"  checkpoint saved → {ckpt_path}")
+            for name in head_names:
+                ckpt_path = os.path.join(output_dirs[name], "checkpoints", f"model-{e+1:02d}.pt")
+                torch.save(
+                    {
+                        "epoch": e,
+                        "model_state_dict": model.heads[name].state_dict(),
+                        "optimizer_state_dict": optimizer[name].state_dict(),
+                    },
+                    ckpt_path,
+                )
+                print(f"    {name} checkpoint → {ckpt_path}")
 
-    writer.close()
+    for w in writers.values():
+        w.close()
 
 
 # ---------------------------------------------------------------------------
-# Testing loop
+# Multi-head testing — one encode → evaluate all heads sequentially
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def test(cfg, model, testdata_loader, epoch, filename):
+def test(cfg, model, testdata_loader, epoch):
     fb = cfg.NF
-    _amp_cfg = cfg.get("amp_dtype", "fp32")
-    _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
-    autocast_ctx = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
+    head_names = list(model.heads.keys())
 
-    targets_all, outputs_all = [], []
-    toas_all, teas_all, idxs_all, info_all, frames_counter = [], [], [], [], []
+    # Build per-head results aggregators
+    per_head = {
+        n: {
+            "targets_all": [], "outputs_all": [], "toas_all": [],
+            "teas_all": [], "idxs_all": [], "info_all": [], "frames_counter": [],
+        }
+        for n in head_names
+    }
 
     model.eval()
+
     for video_data, data_info in tqdm(testdata_loader, desc=f"Test epoch {epoch}"):
         video_data = video_data.to(cfg.device, non_blocking=True)
         data_info = data_info.to(cfg.device, non_blocking=True)
-
         video_data = torch.swapaxes(video_data, 1, 2)
-
-        t_shape = (video_data.shape[0], video_data.shape[2] - fb)
-        targets = torch.full(t_shape, -100).to(video_data.device)
-        outputs = torch.full(t_shape, -100, dtype=torch.float).to(video_data.device)
 
         idx_batch = data_info[:, 1]
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         info_batch = data_info[:, 7:11]
 
-        # Pre-compute frozen encoder: [1, n_clips, N_patches, embed_dim]
+        # Encode ONCE for all heads
         patches = model.encode_video_clips(video_data, fb)
-        if not model._slot_based:
-            patches = patches.mean(dim=2)  # spatial pool
 
-        state = None
-        for i in range(fb, video_data.shape[2]):
-            target = gt_cls_target(i, toa_batch, tea_batch).long()
+        for name in head_names:
+            head = model.heads[name]
+            is_slot = head._slot_based
+            patches_in = patches if is_slot else patches.mean(dim=2)
 
-            with autocast_ctx:
-                feat = patches[:, i - fb, ...]
-                output, state = model.forward_temporal_step(feat, state)
+            t_shape = (video_data.shape[0], video_data.shape[2] - fb)
+            targets = torch.full(t_shape, -100).to(video_data.device)
+            outputs = torch.full(t_shape, -100, dtype=torch.float).to(video_data.device)
 
-            if cfg.get("apply_softmax", True):
-                output = output.softmax(dim=1)
+            state = None
+            for i in range(fb, video_data.shape[2]):
+                target = gt_cls_target(i, toa_batch, tea_batch).long()
+                feat = patches_in[:, i - fb, ...]
+                output, state = head.forward_temporal_step(feat, state)
 
-            targets[:, i - fb] = target.clone()
-            outputs[:, i - fb] = output[:, 1].clone()
+                if cfg.get("apply_softmax", True):
+                    output = output.softmax(dim=1)
 
-        targets_all.append(targets.view(-1).tolist())
-        outputs_all.append(outputs.view(-1).tolist())
-        toas_all.append(toa_batch.tolist())
-        teas_all.append(tea_batch.tolist())
-        idxs_all.append(idx_batch.tolist())
-        info_all.append(info_batch.tolist())
-        frames_counter.append(video_data.shape[2])
+                targets[:, i - fb] = target.clone()
+                outputs[:, i - fb] = output[:, 1].clone()
 
+            res = per_head[name]
+            res["targets_all"].append(targets.view(-1).tolist())
+            res["outputs_all"].append(outputs.view(-1).tolist())
+            res["toas_all"].append(toa_batch.tolist())
+            res["teas_all"].append(tea_batch.tolist())
+            res["idxs_all"].append(idx_batch.tolist())
+            res["info_all"].append(info_batch.tolist())
+            res["frames_counter"].append(video_data.shape[2])
+
+    # Save and evaluate per-head
     import pickle
 
-    print(f"  saving results → {filename}")
-    with open(filename, "wb") as f:
-        pickle.dump(
-            {
-                "targets": targets_all,
-                "outputs": outputs_all,
-                "toas": np.array(toas_all).reshape(-1),
-                "teas": np.array(teas_all).reshape(-1),
-                "idxs": np.array(idxs_all).reshape(-1),
-                "info": np.array(info_all).reshape(-1, 4),
-                "frames_counter": np.array(frames_counter).reshape(-1),
-            },
-            f,
-        )
+    for name in head_names:
+        res = per_head[name]
+        head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
+        eval_dir = os.path.join(head_output, "eval")
+        os.makedirs(eval_dir, exist_ok=True)
+        filename = os.path.join(eval_dir, f"results-{epoch:02d}.pkl")
+
+        print(f"\n  [{name}] saving results → {filename}")
+        with open(filename, "wb") as f:
+            pickle.dump(
+                {
+                    "targets": res["targets_all"],
+                    "outputs": res["outputs_all"],
+                    "toas": np.array(res["toas_all"]).reshape(-1),
+                    "teas": np.array(res["teas_all"]).reshape(-1),
+                    "idxs": np.array(res["idxs_all"]).reshape(-1),
+                    "info": np.array(res["info_all"]).reshape(-1, 4),
+                    "frames_counter": np.array(res["frames_counter"]).reshape(-1),
+                },
+                f,
+            )
+
+        content = movad_utils.load_results(filename)
+        print(f"  [{name}] Results:")
+        print_results(cfg, *evaluation(FPS=cfg.FPS, **content))
 
 
 # ---------------------------------------------------------------------------
@@ -384,31 +475,46 @@ if __name__ == "__main__":
     )
 
     # --- Model -------------------------------------------------------------
-    checkpoint = None
-    epoch = 0
+    epoch_val = 0
+    model = build_multi_head_vjepa(cfg)
 
-    model = build_cls_vjepa(cfg)
-    print(f"Temporal model: {cfg.get('temporal_model', 'lstm')}")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
+    # Resume / load checkpoints per head
     if cfg.epoch != -1:
-        try:
-            checkpoint = movad_utils.load_checkpoint(cfg)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            epoch = checkpoint["epoch"] + 1
-            print(f"Resumed from epoch {epoch}")
-        except FileNotFoundError:
-            print(f"No checkpoint found at epoch {cfg.epoch} — starting fresh")
-            epoch = cfg.epoch if cfg.epoch > 0 else 0
+        for name, head in model.heads.items():
+            head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
+            try:
+                ckpt_cfg = EasyDict({
+                    "output": head_output,
+                    "epoch": cfg.epoch,
+                    "device": cfg.device,
+                })
+                ckpt = movad_utils.load_checkpoint(ckpt_cfg)
+                head.load_state_dict(ckpt["model_state_dict"])
+                ep = ckpt["epoch"] + 1
+                print(f"  [{name}] resumed from epoch {ep}")
+            except FileNotFoundError:
+                print(f"  [{name}] no checkpoint at epoch {cfg.epoch} — starting fresh")
+        epoch_val = cfg.epoch if cfg.epoch > 0 else 0
 
     if cfg.phase == "train":
-        optimizer, lr_scheduler = build_optimizer(cfg, model, checkpoint)
-        train(cfg, model, traindata_loader, optimizer, lr_scheduler, epoch)
+        train(cfg, model, traindata_loader, epoch_val)
 
     elif cfg.phase == "test":
-        filename = movad_utils.get_result_filename(cfg, epoch)
-        if not os.path.exists(filename):
-            test(cfg, model, testdata_loader, epoch, filename)
-
-        content = movad_utils.load_results(filename)
-        print_results(cfg, *evaluation(FPS=cfg.FPS, **content))
+        if cfg.epoch == -1:
+            cfg.epoch = 0
+        # Load each head's checkpoint
+        for name, head in model.heads.items():
+            head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
+            try:
+                ckpt_cfg = EasyDict({
+                    "output": head_output,
+                    "epoch": cfg.epoch,
+                    "device": cfg.device,
+                })
+                ckpt = movad_utils.load_checkpoint(ckpt_cfg)
+                head.load_state_dict(ckpt["model_state_dict"])
+                ep = ckpt["epoch"] + 1
+                print(f"  [{name}] loaded checkpoint epoch {ep}")
+            except FileNotFoundError:
+                print(f"  [{name}] WARNING: no checkpoint at epoch {cfg.epoch}")
+        test(cfg, model, testdata_loader, cfg.epoch)

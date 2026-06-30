@@ -635,6 +635,7 @@ class ClsVJEPA(nn.Module):
         eps_random: float = 0.0,
         # Inverted attention (SlotSSM reference repo style)
         use_inverted_attention: bool = False,
+        verbose: bool = True,
     ):
         super().__init__()
         self.encoder = encoder
@@ -674,8 +675,9 @@ class ClsVJEPA(nn.Module):
             self.apply(_weights_init)
 
             mode = "sparse" if is_sparse else "dense"
-            print(f"\n[ClsVJEPA] SlotSSM ({mode}) — Parameter summary:")
-            _print_param_summary(encoder, self.temporal, self.classifier)
+            if verbose:
+                print(f"\n[ClsVJEPA] SlotSSM ({mode}) — Parameter summary:")
+                _print_param_summary(encoder, self.temporal, self.classifier)
             return
 
         # ---- Standard path --------------------------------------------------
@@ -700,11 +702,12 @@ class ClsVJEPA(nn.Module):
 
         self.apply(_weights_init)
 
-        print("\n[ClsVJEPA] Parameter summary:")
-        _print_param_summary(
-            encoder, self.temporal,
-            nn.ModuleList([self.lin1, self.lin2, self.lin3, self.bn]),
-        )
+        if verbose:
+            print("\n[ClsVJEPA] Parameter summary:")
+            _print_param_summary(
+                encoder, self.temporal,
+                nn.ModuleList([self.lin1, self.lin2, self.lin3, self.bn]),
+            )
 
     def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Run the frozen ViT over every NF-frame sliding window in one batch of videos.
@@ -788,7 +791,92 @@ class ClsVJEPA(nn.Module):
 
 
 # ===========================================================================
-# Factory
+# Multi-Head Wrapper — shared frozen encoder, multiple independent temporal
+# heads trained on the same encoded features from a single ViT pass.
+# ===========================================================================
+class MultiHeadVJEPA(nn.Module):
+    """One frozen V-JEPA encoder → multiple temporal + classifier heads.
+
+    Each head trains independently (its own optimizer, checkpoint, and
+    TensorBoard writer).  The encoder runs *once* per batch and the resulting
+    patch features are reused by all heads.  Losses are never summed — each
+    head's ``.backward()`` flows only through its own parameters.
+
+    Usage
+    -----
+    >>> model = build_multi_head_vjepa(cfg)   # cfg.temporal_heads = [...]
+    >>> patches = model.encode_video_clips(video_data, fb)   # encode once
+    >>>
+    >>> # Train head-by-head
+    >>> for name, head in model.heads.items():
+    >>>     opt = optimizers[name]
+    >>>     opt.zero_grad()
+    >>>     feat = patches if head._slot_based else patches.mean(dim=2)
+    >>>     loss = run_temporal_loop(head, feat, ...)
+    >>>     loss.backward()
+    >>>     opt.step()
+    """
+
+    def __init__(self, encoder: VJEPA2Encoder, heads_configs: list[dict]):
+        super().__init__()
+        self.encoder = encoder
+        self.heads = nn.ModuleDict()
+        self.head_configs: dict[str, dict] = {}
+
+        for head_cfg in heads_configs:
+            name = head_cfg["name"]
+            if name in self.heads:
+                raise ValueError(f"Duplicate head name: {name}")
+            self.head_configs[name] = dict(head_cfg)
+
+            self.heads[name] = ClsVJEPA(
+                encoder=encoder,
+                embed_dim=encoder.embed_dim,
+                dim_latent=head_cfg.get("dim_latent", 1024),
+                dropout=head_cfg.get("dropout", 0.5),
+                temporal_model=head_cfg["temporal_model"],
+                rnn_state_size=head_cfg.get("rnn_state_size", 1024),
+                rnn_cell_num=head_cfg.get("rnn_cell_num", 3),
+                mamba_d_state=head_cfg.get("mamba_d_state", 128),
+                mamba_d_conv=head_cfg.get("mamba_d_conv", 4),
+                mamba_expand=head_cfg.get("mamba_expand", 2),
+                mamba_version=head_cfg.get("mamba_version", "mamba2"),
+                num_slots=head_cfg.get("num_slots", 32),
+                slot_dim=head_cfg.get("slot_dim", 512),
+                num_ssm_blocks=head_cfg.get("num_ssm_blocks", 4),
+                top_k=head_cfg.get("top_k", 16),
+                eps_random=head_cfg.get("eps_random", 0.0),
+                use_inverted_attention=head_cfg.get("use_inverted_attention", False),
+                verbose=False,
+            )
+
+        # Summarise
+        frozen = _count_frozen(self.encoder)
+        total_trainable = 0
+        print(f"\n[MultiHeadVJEPA] {len(self.heads)} heads — shared encoder, independent temporal models")
+        print(f"  Frozen (encoder): {frozen / 1e6:.1f}M")
+        for name, head in self.heads.items():
+            tp = _count(head)
+            total_trainable += tp
+            print(f"  Head '{name}' ({head.temporal_type}): {tp / 1e6:.2f}M trainable")
+        print("  ---")
+        print(f"  Total trainable (all heads): {total_trainable / 1e6:.2f}M")
+
+    def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
+        """Run the frozen ViT once over all stride-1 clips in one batch.
+
+        Delegates to the first head's :meth:`ClsVJEPA.encode_video_clips`
+        (all heads share the same encoder, so the output is identical).
+
+        Returns ``[B, n_clips, N_patches, embed_dim]`` — raw patch tokens.
+        Standard-path heads call ``.mean(dim=2)`` on this; slot-based heads
+        use the full tensor.
+        """
+        return next(iter(self.heads.values())).encode_video_clips(x, num_frames)
+
+
+# ===========================================================================
+# Factories
 # ===========================================================================
 def build_cls_vjepa(cfg) -> ClsVJEPA:
     encoder = build_vjepa2_encoder(cfg)
@@ -816,4 +904,30 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         use_inverted_attention=cfg.get("use_inverted_attention", False),
     ).to(cfg.device)
 
+    return model
+
+
+def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
+    """Build a MultiHeadVJEPA from a multi-config CLI invocation.
+
+    The CLI produces ``cfg._head_cfgs_flat`` — a list of dicts, each the
+    full parsed YAML from one ``--config`` path, with a ``"name"`` field
+    derived from the file basename.  The first config is the master (encoder,
+    data, training settings); each subsequent config contributes its
+    ``temporal_model`` settings.
+
+    Every head inherits shared defaults from the master config (``dim_latent``,
+    ``dropout``, etc.) but can override them per-head.
+    """
+    encoder = build_vjepa2_encoder(cfg)
+
+    if cfg.get("compile", True) and hasattr(torch, "compile"):
+        encoder.encoder = torch.compile(encoder.encoder, mode="reduce-overhead")
+
+    head_configs = []
+    for hc in cfg._head_cfgs_flat:
+        merged = dict(hc)   # full YAML from that config file
+        head_configs.append(merged)
+
+    model = MultiHeadVJEPA(encoder=encoder, heads_configs=head_configs).to(cfg.device)
     return model
