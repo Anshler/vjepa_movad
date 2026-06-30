@@ -181,6 +181,7 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
 
     model.train(True)
     is_slot_based = model._slot_based
+    accum_steps = cfg.get("grad_accum", 1)
 
     for e in range(begin_epoch, cfg.epochs):
         epoch_total_loss = 0.0
@@ -188,13 +189,14 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
 
         loader_iter = iter(traindata_loader)
 
-        # --- First batch: load synchronously (no previous batch to prefetch) ---
+        # --- First batch: load synchronously ---
         video_data, data_info = next(loader_iter)
         video_data = video_data.to(cfg.device, non_blocking=True)
         data_info = data_info.to(cfg.device, non_blocking=True)
 
         n_batches = len(traindata_loader)
         pbar = tqdm(range(n_batches), desc=f"Epoch {e+1}/{cfg.epochs}")
+        accum_loss = torch.tensor(0.0, device=cfg.device)
         for j in pbar:
             video_data = torch.swapaxes(video_data, 1, 2)            # [B, C, F, H, W]
             v_len = video_data.shape[2]
@@ -220,10 +222,18 @@ def train(cfg, model, traindata_loader, optimizer, lr_scheduler, begin_epoch):
                 cfg, criterion, autocast_ctx,
             )
 
-            # Single backward + step per video (fuses 28 micro-operations)
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            epoch_total_loss += total_loss.item()
+            epoch_frames += max(f_count, 1)
+
+            # Accumulate gradient (divide so grad_accum=N means average over N batches)
+            accum_loss = accum_loss + (total_loss / accum_steps)
+
+            step_now = ((j + 1) % accum_steps == 0) or (j == n_batches - 1)
+            if step_now:
+                optimizer.zero_grad()
+                accum_loss.backward()
+                optimizer.step()
+                accum_loss = torch.tensor(0.0, device=cfg.device)
 
             # --- Per-video logging -------------------------------------
             avg_loss = total_loss.item() / max(f_count, 1)
