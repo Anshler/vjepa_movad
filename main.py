@@ -74,7 +74,7 @@ def parse_configs():
         #"cfgs/vjepa_v1.yaml",
         "cfgs/vjepa_mamba.yaml",
         "cfgs/vjepa_slotssm.yaml",
-        "cfgs/vjepa_sparse_slotssm.yaml",
+        #"cfgs/vjepa_sparse_slotssm.yaml",
         #"cfgs/vjepa_slotssm_inv.yaml",
         #"cfgs/vjepa_sparse_slotssm_inv.yaml",
     ]
@@ -87,6 +87,12 @@ def parse_configs():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--snapshot_interval", type=int, default=10)
     parser.add_argument("--epoch", type=int, default=-1, help="Resume from (train) or eval (test)")
+    parser.add_argument("--enable_validation", action="store_true", default=True,
+                        help="Run validation periodically during training (default: True)")
+    parser.add_argument("--no-enable_validation", action="store_false", dest="enable_validation",
+                        help="Disable validation during training")
+    parser.add_argument("--validation_epoch_step", type=int, default=10,
+                        help="Validate every N epochs during training (default: 10)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
     args = parser.parse_args()
 
@@ -138,6 +144,19 @@ def set_deterministic(seed: int):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint helpers — strip frozen encoder weights (saves ~600MB per ckpt)
+# ---------------------------------------------------------------------------
+def _head_state_dict_without_encoder(head):
+    """Return ``head.state_dict()`` excluding the shared frozen encoder weights."""
+    return {k: v for k, v in head.state_dict().items() if not k.startswith("encoder.")}
+
+
+def _load_head_state_dict(head, state_dict):
+    """Load state dict into a head, skipping encoder keys (frozen, loaded separately)."""
+    head.load_state_dict(state_dict, strict=False)
+
+
+# ---------------------------------------------------------------------------
 # Training loop — one encode → N independent temporal trainings
 #
 # Works for 1 head or N heads — same code path either way.
@@ -145,12 +164,16 @@ def set_deterministic(seed: int):
 # writer.  Losses are never summed — ``.backward()`` flows only through that
 # head's temporal + classifier parameters.  The shared encoder is frozen.
 # ---------------------------------------------------------------------------
-def train(cfg, model, traindata_loader, begin_epoch):
+def train(cfg, model, traindata_loader, begin_epoch,
+          testdata_loader=None, validation_epoch_step=10):
     """Train a MultiHeadVJEPA: encode once per batch, then loop heads sequentially.
 
     Heads are trained **independently** — different losses, different
     optimizers, different checkpoints.  Each head's ``.backward()`` only
     touches that head's parameters.
+
+    If ``testdata_loader`` is provided, validation runs every
+    ``validation_epoch_step`` epochs and metrics are logged to tensorboard.
     """
     head_names = list(model.heads.keys())
 
@@ -351,26 +374,47 @@ def train(cfg, model, traindata_loader, begin_epoch):
                 torch.save(
                     {
                         "epoch": e,
-                        "model_state_dict": model.heads[name].state_dict(),
+                        "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
                         "optimizer_state_dict": optimizer[name].state_dict(),
                     },
                     ckpt_path,
                 )
                 print(f"    {name} checkpoint → {ckpt_path}")
 
+        # Validation
+        if testdata_loader is not None and (e + 1) % validation_epoch_step == 0:
+            print(f"\n  === Validation at epoch {e+1} ===")
+            _evaluate_model(cfg, model, testdata_loader, e + 1, writers=writers)
+            model.train(True)
+
     for w in writers.values():
         w.close()
 
 
 # ---------------------------------------------------------------------------
-# Multi-head testing — one encode → evaluate all heads sequentially
+# Shared evaluation helper — one encode → evaluate all heads sequentially
+# Used by both train-time validation and standalone testing.
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def test(cfg, model, testdata_loader, epoch):
+def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
+    """Run validation/test inference and compute metrics for all heads.
+
+    Parameters
+    ----------
+    cfg : EasyDict
+    model : MultiHeadVJEPA
+    testdata_loader : DataLoader
+    epoch : int — current epoch number (used for result filenames and logging step)
+    writers : dict[str, SummaryWriter] | None — if provided, metrics are logged
+              to tensorboard under ``val/<metric>`` for each head.
+
+    Returns
+    -------
+    dict[str, dict] — per-head metrics dict as returned by ``evaluation()``.
+    """
     fb = cfg.NF
     head_names = list(model.heads.keys())
 
-    # Build per-head results aggregators
     per_head = {
         n: {
             "targets_all": [], "outputs_all": [], "toas_all": [],
@@ -381,7 +425,7 @@ def test(cfg, model, testdata_loader, epoch):
 
     model.eval()
 
-    for video_data, data_info in tqdm(testdata_loader, desc=f"Test epoch {epoch}"):
+    for video_data, data_info in tqdm(testdata_loader, desc=f"Val epoch {epoch}"):
         video_data = video_data.to(cfg.device, non_blocking=True)
         data_info = data_info.to(cfg.device, non_blocking=True)
         video_data = torch.swapaxes(video_data, 1, 2)
@@ -391,7 +435,6 @@ def test(cfg, model, testdata_loader, epoch):
         tea_batch = data_info[:, 3]
         info_batch = data_info[:, 7:11]
 
-        # Encode ONCE for all heads
         patches = model.encode_video_clips(video_data, fb)
 
         for name in head_names:
@@ -427,6 +470,7 @@ def test(cfg, model, testdata_loader, epoch):
     # Save and evaluate per-head
     import pickle
 
+    all_metrics = {}
     for name in head_names:
         res = per_head[name]
         head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
@@ -434,7 +478,6 @@ def test(cfg, model, testdata_loader, epoch):
         os.makedirs(eval_dir, exist_ok=True)
         filename = os.path.join(eval_dir, f"results-{epoch:02d}.pkl")
 
-        print(f"\n  [{name}] saving results → {filename}")
         with open(filename, "wb") as f:
             pickle.dump(
                 {
@@ -450,8 +493,34 @@ def test(cfg, model, testdata_loader, epoch):
             )
 
         content = movad_utils.load_results(filename)
-        print(f"  [{name}] Results:")
-        print_results(cfg, *evaluation(FPS=cfg.FPS, **content))
+        (auc_roc, auc_pr, f1_one, f1_mean, accuracy,
+         report, eval_per_class, eval_per_class_ego) = evaluation(FPS=cfg.FPS, **content)
+        all_metrics[name] = {
+            "auc_roc": auc_roc, "auc_pr": auc_pr, "f1": f1_one,
+            "f1_mean": f1_mean, "accuracy": accuracy,
+        }
+
+        # Log to tensorboard if writers provided (train-time validation)
+        if writers is not None and name in writers:
+            writers[name].add_scalar("val/auc_roc", auc_roc, epoch)
+            writers[name].add_scalar("val/auc_pr", auc_pr, epoch)
+            writers[name].add_scalar("val/f1", f1_one, epoch)
+            writers[name].add_scalar("val/f1_mean", f1_mean, epoch)
+            writers[name].add_scalar("val/accuracy", accuracy, epoch)
+
+        print(f"  [{name}] validation results (epoch {epoch}):")
+        print_results(cfg, auc_roc, auc_pr, f1_one, f1_mean, accuracy,
+                      report, eval_per_class, eval_per_class_ego)
+
+    return all_metrics
+
+
+# ---------------------------------------------------------------------------
+# Standalone testing — load checkpoints and evaluate
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def test(cfg, model, testdata_loader, epoch):
+    return _evaluate_model(cfg, model, testdata_loader, epoch, writers=None)
 
 
 # ---------------------------------------------------------------------------
@@ -466,12 +535,14 @@ if __name__ == "__main__":
         cfg.NF = cfg.num_frames
 
     # --- Data --------------------------------------------------------------
+    _enable_val = cfg.phase == "train" and cfg.get("enable_validation", False)
     traindata_loader, testdata_loader = setup_dota(
         Dota,
         cfg,
         num_workers=cfg.num_workers,
         VCL=cfg.get("VCL", None),
         phase=cfg.phase,
+        enable_val=_enable_val,
     )
 
     # --- Model -------------------------------------------------------------
@@ -489,7 +560,7 @@ if __name__ == "__main__":
                     "device": cfg.device,
                 })
                 ckpt = movad_utils.load_checkpoint(ckpt_cfg)
-                head.load_state_dict(ckpt["model_state_dict"])
+                _load_head_state_dict(head, ckpt["model_state_dict"])
                 ep = ckpt["epoch"] + 1
                 print(f"  [{name}] resumed from epoch {ep}")
             except FileNotFoundError:
@@ -497,7 +568,12 @@ if __name__ == "__main__":
         epoch_val = cfg.epoch if cfg.epoch > 0 else 0
 
     if cfg.phase == "train":
-        train(cfg, model, traindata_loader, epoch_val)
+        val_step = cfg.get("validation_epoch_step", 10)
+        if testdata_loader is not None:
+            val_step = min(val_step, cfg.epochs)
+        train(cfg, model, traindata_loader, epoch_val,
+              testdata_loader=testdata_loader,
+              validation_epoch_step=val_step)
 
     elif cfg.phase == "test":
         if cfg.epoch == -1:
@@ -512,7 +588,7 @@ if __name__ == "__main__":
                     "device": cfg.device,
                 })
                 ckpt = movad_utils.load_checkpoint(ckpt_cfg)
-                head.load_state_dict(ckpt["model_state_dict"])
+                _load_head_state_dict(head, ckpt["model_state_dict"])
                 ep = ckpt["epoch"] + 1
                 print(f"  [{name}] loaded checkpoint epoch {ep}")
             except FileNotFoundError:

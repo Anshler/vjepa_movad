@@ -862,6 +862,12 @@ class MultiHeadVJEPA(nn.Module):
         print("  ---")
         print(f"  Total trainable (all heads): {total_trainable / 1e6:.2f}M")
 
+    def train(self, mode: bool = True):
+        """Set training mode — temporal heads follow ``mode``, encoder stays eval."""
+        super().train(mode)
+        self.encoder.eval()
+        return self
+
     def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Run the frozen ViT once over all stride-1 clips in one batch.
 
@@ -882,7 +888,7 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
     encoder = build_vjepa2_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="reduce-overhead")
+        encoder.encoder = torch.compile(encoder.encoder, mode="default")
 
     model = ClsVJEPA(
         encoder=encoder,
@@ -922,7 +928,7 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
     encoder = build_vjepa2_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="reduce-overhead")
+        encoder.encoder = torch.compile(encoder.encoder, mode="default")
 
     head_configs = []
     for hc in cfg._head_cfgs_flat:

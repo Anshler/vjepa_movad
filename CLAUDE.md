@@ -89,19 +89,42 @@ For shorter inline commands, use the Bash tool directly (the harness routes it t
 
 ### Training
 
+Single-head (one temporal model):
 ```bash
-wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase train --epochs 200'
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml --phase train --epochs 200'
+```
+
+Multi-head (one encode → multiple temporal models trained in parallel):
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml cfgs/vjepa_slotssm.yaml cfgs/vjepa_sparse_slotssm.yaml --phase train --epochs 200'
+```
+
+Validation runs automatically every 10 epochs during training (default). Metrics (AUC, PR-AUC, F1, F1-mean, accuracy) are logged to TensorBoard under `val/<metric>` for each head. Results pickles are saved to `{head_output}/eval/results-{epoch:02d}.pkl`.
+
+Disable validation:
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml --phase train --no-enable_validation'
+```
+
+Validate every 5 epochs:
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml --phase train --validation_epoch_step 5'
 ```
 
 Resume from checkpoint:
 ```bash
-wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase train --epoch 50'
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml --phase train --epoch 50'
 ```
 
 ### Testing / evaluation
 
 ```bash
-wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_v1.yaml --phase test --epoch 190'
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml --phase test --epoch 190'
+```
+
+Multi-head evaluation (all heads evaluated in one pass, sharing encoder output):
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml cfgs/vjepa_slotssm.yaml cfgs/vjepa_sparse_slotssm.yaml --phase test --epoch 190'
 ```
 
 ### Smoke tests (all 6 temporal variants + resolution flexibility)
@@ -156,7 +179,9 @@ The code gracefully degrades: `_HAS_MAMBA_SSM` and `_HAS_FLASH_ATTN` flags contr
 - State is carried across timesteps: LSTM tuples `(h, c)`, Mamba uses `MambaCache`.
 - Sparse SlotSSM entropy penalty is added directly to the per-frame loss in the training loop (not inside the model).
 - Slot diagnostics (mass_min, mass_mean, usage_frac) are logged to TensorBoard for inverted attention models.
+- **Checkpoints**: `model.heads[name].state_dict()` is filtered to exclude the frozen encoder (saves ~600MB per ckpt per head). Only temporal + classifier weights are stored. `MultiHeadVJEPA.train()` overrides the default behavior — heads follow the requested mode but the encoder is always pinned to `eval()`.
 - Checkpoints save at `cfg.snapshot_interval` epochs to `{cfg.output}/checkpoints/model-{epoch:02d}.pt`.
+- **Validation during training**: runs every `validation_epoch_step` epochs (default 10, clamped to `--epochs` so it runs at least once). Uses the same `_evaluate_model()` code path as standalone testing — one encode for all heads, then each head evaluated independently. Metrics logged to TensorBoard under `val/auc_roc`, `val/auc_pr`, `val/f1`, `val/f1_mean`, `val/accuracy`.
 - Evaluation results pickle to `{cfg.output}/eval/results-{epoch:02d}.pkl`.
 
 ## Evaluation metrics

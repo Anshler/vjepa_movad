@@ -230,7 +230,7 @@ class Dota(Dataset):
 
 
 def setup_dota(Dota, cfg, num_workers=-1,
-               VCL=None, phase=None):
+               VCL=None, phase=None, enable_val=False):
     mean = cfg.get('data_mean', [0.218, 0.220, 0.209])
     std = cfg.get('data_std', [0.277, 0.280, 0.277])
     params = {
@@ -293,6 +293,15 @@ def setup_dota(Dota, cfg, num_workers=-1,
             pin_memory=pin_memory_val)
         print("# train set: {}".format(len(train_data)))
         cfg.update(FPS=train_data.fps)
+
+        # Optionally also create the validation loader (for --enable_validation)
+        if enable_val:
+            val_data = Dota(cfg.data_path, 'val', transforms=transform_dict)
+            testdata_loader = DataLoader(
+                dataset=val_data, batch_size=1, shuffle=False,
+                drop_last=True, num_workers=num_workers,
+                pin_memory=pin_memory_val)
+            print("# val set: {}".format(len(val_data)))
     else:
         if phase == 'test':
             # validation dataset
