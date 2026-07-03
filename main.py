@@ -473,12 +473,12 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
 
     for batch in tqdm(testdata_loader, desc=f"Val epoch {epoch}"):
         if _precomputed:
-            # batch is a dict: {'patches_full': [n_clips, N, D] fp16, 'data_info': [11], 'v_len': int}
+            # Collate already stacked batch dim: patches_full [1, n_clips, N, D], data_info [1, 11]
             data = batch
             v_len = int(data["v_len"])
             B = 1
-            patches = data["patches_full"].to(cfg.device, non_blocking=True).unsqueeze(0).float()
-            data_info = data["data_info"].to(cfg.device, non_blocking=True).unsqueeze(0)
+            patches = data["patches_full"].to(cfg.device, non_blocking=True).float()
+            data_info = data["data_info"].to(cfg.device, non_blocking=True)
         else:
             video_data, data_info = batch
             video_data = video_data.to(cfg.device, non_blocking=True)

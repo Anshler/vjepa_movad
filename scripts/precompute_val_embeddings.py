@@ -169,13 +169,6 @@ def main():
     # on a network/WSL mount can bottleneck the whole pipeline.
     print(f"Encoding {len(val_dataset)} videos → {embed_dir}")
     global_idx = 0
-    pending: list[tuple[str, dict]] = []   # [(video_key, save_dict), …]
-    _flush_every = 200   # flush every N videos to keep RAM ~2 GB
-
-    def _flush():
-        for video_key, save_dict in pending:
-            out_path = os.path.join(embed_dir, f"{video_key}.pt")
-            torch.save(save_dict, out_path)
 
     for video_data, data_info in tqdm(val_loader, desc="Encoding val"):
         video_key = val_dataset.keys[global_idx]
@@ -187,28 +180,20 @@ def main():
             patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, N, D]
 
         # Move to CPU immediately and free GPU tensors — full-video
-        # mega-batches are large (100+ clips) and variable-sized, which
-        # fragments the CUDA allocator cache across 1400+ iterations.
         v_len = video_data.shape[2]  # capture before del
         patches_cpu = patches[0].cpu().half()          # [n_clips, N, D]  fp16
         info_cpu = data_info[0].cpu()                  # [11]  fp32
         del patches, video_data, data_info
         torch.cuda.empty_cache()
 
-        pending.append((video_key, {
+        save_dict = {
             "patches_full": patches_cpu,
             "data_info": info_cpu,
             "v_len": int(v_len),
-        }))
+        }
+        out_path = os.path.join(embed_dir, f"{video_key}.pt")
+        torch.save(save_dict, out_path)
         global_idx += 1
-
-        if len(pending) >= _flush_every:
-            _flush()
-            pending.clear()
-
-    if pending:
-        _flush()
-        pending.clear()
 
     print(f"Done — {global_idx} embeddings saved to {embed_dir}")
 
