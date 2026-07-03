@@ -56,6 +56,49 @@ from model import build_multi_head_vjepa
 
 
 # ---------------------------------------------------------------------------
+# Precomputed validation dataset — loads cached encoder embeddings from disk
+# to skip the frozen ViT forward pass during validation.
+# ---------------------------------------------------------------------------
+class PrecomputedValDataset(torch.utils.data.Dataset):
+    """Loads precomputed V-JEPA encoder embeddings (``.pt`` files).
+
+    Each file is a dict with keys:
+        ``patches_full`` — fp16 ``[n_clips, N_patches, embed_dim]``
+        ``data_info``   — fp32 ``[11]``  (same format as raw DoTA)
+        ``v_len``       — int, total video frames
+    """
+
+    def __init__(self, embed_dir: str):
+        import glob
+
+        self.files = sorted(glob.glob(os.path.join(embed_dir, "*.pt")))
+        if not self.files:
+            raise FileNotFoundError(f"No video_*.pt files found in {embed_dir}")
+        self.is_precomputed = True   # flag checked by _evaluate_model
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        return torch.load(self.files[idx], weights_only=True)
+
+
+def _try_build_precomputed_val_loader(data_path: str, num_workers: int = 0):
+    """Return a DataLoader over precomputed embeddings, or ``None`` if missing."""
+    import glob
+
+    embed_dir = os.path.join(data_path, "embedding_val")
+    if not os.path.isdir(embed_dir) or not glob.glob(os.path.join(embed_dir, "*.pt")):
+        return None
+    dataset = PrecomputedValDataset(embed_dir)
+    pin = os.name != "nt"
+    return torch.utils.data.DataLoader(
+        dataset, batch_size=1, shuffle=False,
+        num_workers=num_workers, pin_memory=pin,
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 #
 # Single-model (backward-compatible):
@@ -425,29 +468,42 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
 
     model.eval()
 
-    for video_data, data_info in tqdm(testdata_loader, desc=f"Val epoch {epoch}"):
-        video_data = video_data.to(cfg.device, non_blocking=True)
-        data_info = data_info.to(cfg.device, non_blocking=True)
-        video_data = torch.swapaxes(video_data, 1, 2)
+    # Detect precomputed embedding loader (dataset has an .is_precomputed flag)
+    _precomputed = getattr(testdata_loader.dataset, "is_precomputed", False)
+
+    for batch in tqdm(testdata_loader, desc=f"Val epoch {epoch}"):
+        if _precomputed:
+            # batch is a dict: {'patches_full': [n_clips, N, D] fp16, 'data_info': [11], 'v_len': int}
+            data = batch
+            v_len = int(data["v_len"])
+            B = 1
+            patches = data["patches_full"].to(cfg.device, non_blocking=True).unsqueeze(0).float()
+            data_info = data["data_info"].to(cfg.device, non_blocking=True).unsqueeze(0)
+        else:
+            video_data, data_info = batch
+            video_data = video_data.to(cfg.device, non_blocking=True)
+            data_info = data_info.to(cfg.device, non_blocking=True)
+            video_data = torch.swapaxes(video_data, 1, 2)
+            B = video_data.shape[0]
+            v_len = video_data.shape[2]
+            patches = model.encode_video_clips(video_data, fb)
 
         idx_batch = data_info[:, 1]
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         info_batch = data_info[:, 7:11]
 
-        patches = model.encode_video_clips(video_data, fb)
-
         for name in head_names:
             head = model.heads[name]
             is_slot = head._slot_based
             patches_in = patches if is_slot else patches.mean(dim=2)
 
-            t_shape = (video_data.shape[0], video_data.shape[2] - fb)
-            targets = torch.full(t_shape, -100).to(video_data.device)
-            outputs = torch.full(t_shape, -100, dtype=torch.float).to(video_data.device)
+            t_shape = (B, v_len - fb)
+            targets = torch.full(t_shape, -100).to(cfg.device)
+            outputs = torch.full(t_shape, -100, dtype=torch.float).to(cfg.device)
 
             state = None
-            for i in range(fb, video_data.shape[2]):
+            for i in range(fb, v_len):
                 target = gt_cls_target(i, toa_batch, tea_batch).long()
                 feat = patches_in[:, i - fb, ...]
                 output, state = head.forward_temporal_step(feat, state)
@@ -465,7 +521,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
             res["teas_all"].append(tea_batch.tolist())
             res["idxs_all"].append(idx_batch.tolist())
             res["info_all"].append(info_batch.tolist())
-            res["frames_counter"].append(video_data.shape[2])
+            res["frames_counter"].append(v_len)
 
     # Save and evaluate per-head
     import pickle
@@ -535,15 +591,37 @@ if __name__ == "__main__":
         cfg.NF = cfg.num_frames
 
     # --- Data --------------------------------------------------------------
-    _enable_val = cfg.phase == "train" and cfg.get("enable_validation", False)
-    traindata_loader, testdata_loader = setup_dota(
-        Dota,
-        cfg,
-        num_workers=cfg.num_workers,
-        VCL=cfg.get("VCL", None),
-        phase=cfg.phase,
-        enable_val=_enable_val,
-    )
+    if cfg.phase == "train":
+        # Training loader — always raw video
+        traindata_loader, _ = setup_dota(
+            Dota, cfg, num_workers=cfg.num_workers,
+            VCL=cfg.get("VCL", None), phase="train",
+        )
+
+        # Validation loader — precomputed embeddings if available, else raw video
+        testdata_loader = None
+        if cfg.get("enable_validation", False):
+            testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.num_workers)
+            if testdata_loader is not None:
+                print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
+            else:
+                _, testdata_loader = setup_dota(
+                    Dota, cfg, num_workers=cfg.num_workers,
+                    VCL=None, phase="test",
+                )
+                print("  Precomputed embeddings not found — using raw video for validation")
+
+    elif cfg.phase == "test":
+        traindata_loader = None
+        testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.num_workers)
+        if testdata_loader is not None:
+            print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
+        else:
+            _, testdata_loader = setup_dota(
+                Dota, cfg, num_workers=cfg.num_workers,
+                VCL=None, phase="test",
+            )
+            print("  Precomputed embeddings not found — using raw video for testing")
 
     # --- Model -------------------------------------------------------------
     epoch_val = 0

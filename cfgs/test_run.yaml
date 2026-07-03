@@ -43,7 +43,7 @@ lr: 0.001
 snapshot_interval: 1
 num_workers: 4
 grad_accum: 1
-amp_dtype: bf16
+amp_dtype: fp16
 
 # --- Augmentation ---------------------------------------------------------
 horizontal_flip_prob: 0.0

@@ -116,6 +116,21 @@ Resume from checkpoint:
 wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python main.py --config cfgs/vjepa_mamba.yaml --phase train --epoch 50'
 ```
 
+### Precomputed validation embeddings
+
+One-time precompute to cache frozen encoder outputs for the val set — skips the ViT during validation, ~10× faster eval.
+
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python scripts/precompute_val_embeddings.py --config cfgs/vjepa_mamba.yaml'
+```
+
+Verify 1 video before the full run:
+```bash
+wsl bash -l -c 'cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad && "$HOME/miniconda3/bin/conda" run -n vjepa2-312 python scripts/precompute_val_embeddings.py --config cfgs/vjepa_mamba.yaml --verify'
+```
+
+Saves to `{data_path}/embedding_val/{video_key}.pt`. Each file: `patches_full` (f16), `data_info` (f32), `v_len` (int). Filename is the metadata key — alignment is inherent. Detection in `main.py` is automatic: if `embedding_val/*.pt` exists, validation/test uses precomputed embeddings instead of raw video encoding.
+
 ### Testing / evaluation
 
 ```bash
@@ -167,7 +182,7 @@ The code gracefully degrades: `_HAS_MAMBA_SSM` and `_HAS_FLASH_ATTN` flags contr
 - `checkpoint_path` in the YAML config points to the `.pt` file; `checkpoint_key` selects the state dict key (typically `"ema_encoder"`).
 - Strict loading is attempted first; on failure, falls back to shape-matched loading with warnings.
 - The `src` package name collision between the vjepa2 codebase and movad's `src/` directory is resolved by temporarily swapping `sys.modules` entries during import.
-- The encoder is wrapped with `torch.compile(mode="reduce-overhead")` by default (config key `compile: false` to disable).
+- The encoder is wrapped with `torch.compile(mode="default")` (config key `compile: false` to disable). `"reduce-overhead"` was swapped for `"default"` to avoid CUDA graph memory lock-in during eval mode.
 - Encoder supports `return_patches=True` (returns `[B, N, embed_dim]` patch tokens for SlotSSM) or `return_patches=False` (spatial mean pool → `[B, embed_dim]`).
 - Uses 3D Rotary Position Embeddings (RoPE) with `interpolate_rope=True` — supports variable frame counts and resolutions at inference.
 
