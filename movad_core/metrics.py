@@ -26,7 +26,7 @@ def evaluation(outputs, targets, FPS, info=None, **kwargs):
 
 def print_results(cfg, AUC_frame, PRAUC_frame, f1score, f1_mean, accuracy,
                   report, eval_per_class, eval_per_class_ego):
-    if cfg.machine_reading:
+    if cfg.get("machine_reading", False):
         res = []
         pres = ''
         if eval_per_class is not None:
