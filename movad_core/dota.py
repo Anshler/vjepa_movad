@@ -12,7 +12,7 @@ from torchvision import transforms
 from pytorchvideo import transforms as T
 
 from torch.utils.data import DataLoader
-from movad_core.data_transform import pad_frames, RandomVerticalFlip, RandomHorizontalFlip
+from movad_core.data_transform import pad_collate_videos, pad_frames, RandomVerticalFlip, RandomHorizontalFlip
 
 
 anomalies = [
@@ -297,29 +297,36 @@ def setup_dota(Dota, cfg, num_workers=-1,
         # Optionally also create the validation loader (for --enable_validation)
         if enable_val:
             val_data = Dota(cfg.data_path, 'val', transforms=transform_dict)
+            # Sort descending (longest first) — the largest CUDA block is
+            # allocated upfront; subsequent smaller batches reuse it.
+            val_data.keys.sort(key=lambda k: val_data.metadata[k]['num_frames'], reverse=True)
             testdata_loader = DataLoader(
-                dataset=val_data, batch_size=1, shuffle=False,
-                drop_last=True, num_workers=num_workers,
-                pin_memory=pin_memory_val)
+                dataset=val_data, batch_size=cfg.batch_size, shuffle=False,
+                drop_last=False, num_workers=num_workers,
+                pin_memory=pin_memory_val, collate_fn=pad_collate_videos)
             print("# val set: {}".format(len(val_data)))
     else:
         if phase == 'test':
             # validation dataset
             test_data = Dota(cfg.data_path, 'val', transforms=transform_dict)
+            # Sort descending (longest first) — avoids CUDA allocator fragmentation
+            test_data.keys.sort(key=lambda k: test_data.metadata[k]['num_frames'], reverse=True)
             testdata_loader = DataLoader(
-                dataset=test_data, batch_size=1, shuffle=False,
-                drop_last=True, num_workers=num_workers,
-                pin_memory=pin_memory_val)
+                dataset=test_data, batch_size=cfg.batch_size, shuffle=False,
+                drop_last=False, num_workers=num_workers,
+                pin_memory=pin_memory_val, collate_fn=pad_collate_videos)
             print("# test set: %d" % (len(test_data)))
         elif phase == 'play':
             # validation dataset
             test_data = Dota(
                 cfg.data_path, 'val',
                 transforms=transform_dict_to_play)
+            # Sort descending (longest first) — avoids CUDA allocator fragmentation
+            test_data.keys.sort(key=lambda k: test_data.metadata[k]['num_frames'], reverse=True)
             testdata_loader = DataLoader(
-                dataset=test_data, batch_size=1, shuffle=False,
-                drop_last=True, num_workers=num_workers,
-                pin_memory=pin_memory_val)
+                dataset=test_data, batch_size=cfg.batch_size, shuffle=False,
+                drop_last=False, num_workers=num_workers,
+                pin_memory=pin_memory_val, collate_fn=pad_collate_videos)
             print("# test set: %d" % (len(test_data)))
         cfg.update(FPS=test_data.fps)
 

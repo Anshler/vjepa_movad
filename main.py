@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import glob
+import json
 import os
 import random
 import sys
@@ -59,21 +61,69 @@ from model import build_multi_head_vjepa
 # Precomputed validation dataset — loads cached encoder embeddings from disk
 # to skip the frozen ViT forward pass during validation.
 # ---------------------------------------------------------------------------
-class PrecomputedValDataset(torch.utils.data.Dataset):
-    """Loads precomputed V-JEPA encoder embeddings (``.pt`` files).
+def pad_collate_embeddings(batch):
+    """Collate precomputed embeddings — pad ``patches_full`` to max clips.
 
-    Each file is a dict with keys:
+    Each sample is a dict with:
+        ``patches_full`` — ``[n_clips_i, N, D]``  (fp16)
+        ``data_info``   — ``[11]``                (fp32)
+        ``v_len``       — int
+
+    Returns a dict with tensors stacked into ``[B, ...]``.
+
+    IMPORTANT: The padded tensor stays in fp16 to keep CPU→GPU transfer
+    memory in check.  ``patches.mean(dim=2)`` and the temporal model's
+    LayerNorm+Mamba blocks handle fp16 input without issues.
+    """
+    max_clips = max(b["patches_full"].shape[0] for b in batch)
+    N = batch[0]["patches_full"].shape[1]
+    D = batch[0]["patches_full"].shape[2]
+    B = len(batch)
+    padded = torch.zeros(B, max_clips, N, D, dtype=torch.float16)
+    data_infos = torch.zeros(B, 11)
+    v_lens = torch.zeros(B, dtype=torch.long)
+    for i, item in enumerate(batch):
+        n = item["patches_full"].shape[0]
+        padded[i, :n] = item["patches_full"]
+        data_infos[i] = item["data_info"]
+        v_lens[i] = item["v_len"]
+    return {"patches_full": padded, "data_info": data_infos, "v_len": v_lens}
+
+
+class PrecomputedValDataset(torch.utils.data.Dataset):
+    """Loads precomputed V-JEPA encoder embeddings (``.pt`` files), sorted by
+    video length so adjacent samples in a DataLoader batch have similar
+    durations — minimising padding waste during bucket batching.
+
+    Sorted **descending** (longest videos first): the first batch allocates
+    the largest CUDA memory block; subsequent smaller batches reuse that
+    block without allocator fragmentation.
+
+    Each ``.pt`` file is a dict with keys:
         ``patches_full`` — fp16 ``[n_clips, N_patches, embed_dim]``
         ``data_info``   — fp32 ``[11]``  (same format as raw DoTA)
         ``v_len``       — int, total video frames
     """
 
-    def __init__(self, embed_dir: str):
-        import glob
+    def __init__(self, embed_dir: str, data_path: str):
 
         self.files = sorted(glob.glob(os.path.join(embed_dir, "*.pt")))
         if not self.files:
-            raise FileNotFoundError(f"No video_*.pt files found in {embed_dir}")
+            raise FileNotFoundError(f"No *.pt files found in {embed_dir}")
+
+        # Load metadata to sort files by video length — this groups
+        # similar-length videos together for efficient batched padding,
+        # without needing to open every .pt file.
+        metadata_path = os.path.join(data_path, "metadata", "metadata_val.json")
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        # Sort DESCENDING: longest videos first → CUDA allocator grabs the
+        # biggest block upfront and reuses it for all smaller later batches.
+        self.files.sort(key=lambda fp: metadata.get(
+            os.path.splitext(os.path.basename(fp))[0], {}
+        ).get("num_frames", 0), reverse=True)
+
         self.is_precomputed = True   # flag checked by _evaluate_model
 
     def __len__(self):
@@ -83,18 +133,16 @@ class PrecomputedValDataset(torch.utils.data.Dataset):
         return torch.load(self.files[idx], weights_only=True)
 
 
-def _try_build_precomputed_val_loader(data_path: str, num_workers: int = 0):
+def _try_build_precomputed_val_loader(data_path: str, batch_size: int, num_workers: int = 0):
     """Return a DataLoader over precomputed embeddings, or ``None`` if missing."""
-    import glob
-
     embed_dir = os.path.join(data_path, "embedding_val")
-    if not os.path.isdir(embed_dir) or not glob.glob(os.path.join(embed_dir, "*.pt")):
+    if not os.path.isdir(embed_dir) or not os.listdir(embed_dir):
         return None
-    dataset = PrecomputedValDataset(embed_dir)
+    dataset = PrecomputedValDataset(embed_dir, data_path)
     pin = os.name != "nt"
     return torch.utils.data.DataLoader(
-        dataset, batch_size=1, shuffle=False,
-        num_workers=num_workers, pin_memory=pin,
+        dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=pin, collate_fn=pad_collate_embeddings,
     )
 
 
@@ -471,23 +519,26 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
     # Detect precomputed embedding loader (dataset has an .is_precomputed flag)
     _precomputed = getattr(testdata_loader.dataset, "is_precomputed", False)
 
-    for batch in tqdm(testdata_loader, desc=f"Val epoch {epoch}"):
+    for batch_idx, batch in enumerate(tqdm(testdata_loader, desc=f"Val epoch {epoch}")):
         if _precomputed:
-            # Collate already stacked batch dim: patches_full [1, n_clips, N, D], data_info [1, 11]
+            # Collate has already padded patches_full [B, max_clips, N, D] fp16.
+            # Keep fp16 on GPU — the temporal model's LayerNorm+Mamba handle it.
             data = batch
-            v_len = int(data["v_len"])
-            B = 1
-            patches = data["patches_full"].to(cfg.device, non_blocking=True).float()
+            B = data["patches_full"].shape[0]
+            patches = data["patches_full"].to(cfg.device, non_blocking=True)
             data_info = data["data_info"].to(cfg.device, non_blocking=True)
+            v_lens = data["v_len"].to(cfg.device)  # [B] original frame counts
+            v_len_max = int(v_lens.max())           # max padded length in bucket
         else:
             video_data, data_info = batch
             video_data = video_data.to(cfg.device, non_blocking=True)
             data_info = data_info.to(cfg.device, non_blocking=True)
             video_data = torch.swapaxes(video_data, 1, 2)
             B = video_data.shape[0]
-            v_len = video_data.shape[2]
+            v_len_max = video_data.shape[2]         # already padded to max in bucket
             patches = model.encode_video_clips(video_data, fb)
 
+        video_len_orig = data_info[:, 0]            # [B] — truth for masking
         idx_batch = data_info[:, 1]
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
@@ -498,15 +549,20 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
             is_slot = head._slot_based
             patches_in = patches if is_slot else patches.mean(dim=2)
 
-            t_shape = (B, v_len - fb)
+            t_shape = (B, v_len_max - fb)
             targets = torch.full(t_shape, -100).to(cfg.device)
             outputs = torch.full(t_shape, -100, dtype=torch.float).to(cfg.device)
 
             state = None
-            for i in range(fb, v_len):
+            for i in range(fb, v_len_max):
                 target = gt_cls_target(i, toa_batch, tea_batch).long()
-                feat = patches_in[:, i - fb, ...]
+                feat = patches_in[:, i - fb, ...].float()   # fp16→fp32 for LayerNorm
                 output, state = head.forward_temporal_step(feat, state)
+
+                # Mask padded positions — identical pattern to training loop
+                flt = i >= video_len_orig
+                target[flt] = -100
+                output[flt] = -100
 
                 if cfg.get("apply_softmax", True):
                     output = output.softmax(dim=1)
@@ -515,13 +571,29 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
                 outputs[:, i - fb] = output[:, 1].clone()
 
             res = per_head[name]
-            res["targets_all"].append(targets.view(-1).tolist())
-            res["outputs_all"].append(outputs.view(-1).tolist())
-            res["toas_all"].append(toa_batch.tolist())
-            res["teas_all"].append(tea_batch.tolist())
-            res["idxs_all"].append(idx_batch.tolist())
-            res["info_all"].append(info_batch.tolist())
-            res["frames_counter"].append(v_len)
+            # Append per-video results, filtering out padded frames
+            for b in range(B):
+                vl = int(video_len_orig[b].item())
+                valid_frames = vl - fb
+                if valid_frames <= 0:
+                    continue
+                res["targets_all"].append(targets[b, :valid_frames].tolist())
+                res["outputs_all"].append(outputs[b, :valid_frames].tolist())
+                res["toas_all"].append(toa_batch[b].item())
+                res["teas_all"].append(tea_batch[b].item())
+                res["idxs_all"].append(idx_batch[b].item())
+                res["info_all"].append(info_batch[b].tolist())
+                res["frames_counter"].append(vl)
+
+        # Free GPU tensors from this batch.  With descending sort the
+        # largest block was allocated first; subsequent batches are smaller
+        # and reuse it without fragmentation.
+        if _precomputed:
+            del patches
+        # Periodically flush the CUDA caching allocator to release any
+        # cached-but-unusable blocks back to the OS.
+        if batch_idx % 50 == 0:
+            torch.cuda.empty_cache()
 
     # Save and evaluate per-head
     import pickle
@@ -601,7 +673,7 @@ if __name__ == "__main__":
         # Validation loader — precomputed embeddings if available, else raw video
         testdata_loader = None
         if cfg.get("enable_validation", False):
-            testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.num_workers)
+            testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.batch_size, cfg.num_workers)
             if testdata_loader is not None:
                 print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
             else:
@@ -613,7 +685,7 @@ if __name__ == "__main__":
 
     elif cfg.phase == "test":
         traindata_loader = None
-        testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.num_workers)
+        testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.batch_size, cfg.num_workers)
         if testdata_loader is not None:
             print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
         else:
