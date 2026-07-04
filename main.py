@@ -472,14 +472,30 @@ def train(cfg, model, traindata_loader, begin_epoch,
                 )
                 print(f"    {name} checkpoint → {ckpt_path}")
 
-        # Validation
+        # Validation — free training tensors first to avoid stacking
         if testdata_loader is not None and (e + 1) % validation_epoch_step == 0:
+            torch.cuda.empty_cache()          # flush training tensors before eval
             print(f"\n  === Validation at epoch {e+1} ===")
             _evaluate_model(cfg, model, testdata_loader, e + 1, writers=writers)
+            torch.cuda.empty_cache()          # flush eval tensors before next epoch
             model.train(True)
 
     for w in writers.values():
         w.close()
+
+    # Save final checkpoint if not already saved at the last epoch
+    if cfg.epochs % cfg.snapshot_interval != 0:
+        for name in head_names:
+            ckpt_path = os.path.join(output_dirs[name], "checkpoints", f"model-{cfg.epochs:02d}.pt")
+            torch.save(
+                {
+                    "epoch": cfg.epochs - 1,
+                    "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
+                    "optimizer_state_dict": optimizer[name].state_dict(),
+                },
+                ckpt_path,
+            )
+            print(f"    {name} final checkpoint → {ckpt_path}")
 
 
 # ---------------------------------------------------------------------------
