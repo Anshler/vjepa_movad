@@ -716,7 +716,7 @@ if __name__ == "__main__":
         # Validation loader — precomputed embeddings if available, else raw video
         testdata_loader = None
         if cfg.get("enable_validation", False):
-            testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.batch_size, cfg.num_workers)
+            testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.batch_size, 1)
             if testdata_loader is not None:
                 print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
             else:
@@ -728,7 +728,7 @@ if __name__ == "__main__":
 
     elif cfg.phase == "test":
         traindata_loader = None
-        testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.batch_size, cfg.num_workers)
+        testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.batch_size, 1)
         if testdata_loader is not None:
             print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
         else:
