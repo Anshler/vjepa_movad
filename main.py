@@ -178,12 +178,12 @@ def parse_configs():
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--snapshot_interval", type=int, default=10)
     parser.add_argument("--epoch", type=int, default=-1, help="Resume from (train) or eval (test)")
-    parser.add_argument("--enable_validation", action="store_true", default=True,
-                        help="Run validation periodically during training (default: True)")
+    parser.add_argument("--enable_validation", action="store_true", default=None,
+                        help="Run validation during training (overrides config)")
     parser.add_argument("--no-enable_validation", action="store_false", dest="enable_validation",
                         help="Disable validation during training")
-    parser.add_argument("--validation_epoch_step", type=int, default=10,
-                        help="Validate every N epochs during training (default: 10)")
+    parser.add_argument("--validation_epoch_step", type=int, default=None,
+                        help="Validate every N epochs (overrides config)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
     args = parser.parse_args()
 
@@ -197,8 +197,10 @@ def parse_configs():
     cfg = all_cfgs[0]
 
     # Derive output from master config before CLI args clobber it
-    _yaml_output = cfg.get("output", "./output/vjepa_v1")
+    _yaml_output = cfg.get("output", "./output")
     _yaml_workers = cfg.get("num_workers", 0)
+    _yaml_enable_val = cfg.get("enable_validation", True)
+    _yaml_val_step = cfg.get("validation_epoch_step", 10)
 
     cfg.update(vars(args))
 
@@ -207,6 +209,11 @@ def parse_configs():
     # Keep YAML num_workers unless explicitly overridden via CLI
     if args.num_workers == 0 and _yaml_workers > 0:
         cfg.num_workers = _yaml_workers
+    # Keep YAML validation settings unless explicitly overridden via CLI
+    if args.enable_validation is None:
+        cfg.enable_validation = _yaml_enable_val
+    if args.validation_epoch_step is None:
+        cfg.validation_epoch_step = _yaml_val_step
 
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -289,7 +296,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
             if k in hc:
                 head_cfgs[name][k] = hc[k]
 
-        output_dir = hc.get("output", os.path.join(cfg.output, name))
+        output_dir = os.path.join(cfg.output, name)
         output_dirs[name] = output_dir
         os.makedirs(os.path.join(output_dir, "checkpoints"), exist_ok=True)
         with open(os.path.join(output_dir, "cfg.yml"), "w") as f:
@@ -617,7 +624,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
     all_metrics = {}
     for name in head_names:
         res = per_head[name]
-        head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
+        head_output = os.path.join(cfg.output, name)
         eval_dir = os.path.join(head_output, "eval")
         os.makedirs(eval_dir, exist_ok=True)
         filename = os.path.join(eval_dir, f"results-{epoch:02d}.pkl")
@@ -718,7 +725,7 @@ if __name__ == "__main__":
     # Resume / load checkpoints per head
     if cfg.epoch != -1:
         for name, head in model.heads.items():
-            head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
+            head_output = os.path.join(cfg.output, name)
             try:
                 ckpt_cfg = EasyDict({
                     "output": head_output,
@@ -746,7 +753,7 @@ if __name__ == "__main__":
             cfg.epoch = 0
         # Load each head's checkpoint
         for name, head in model.heads.items():
-            head_output = model.head_configs[name].get("output", os.path.join(cfg.output, name))
+            head_output = os.path.join(cfg.output, name)
             try:
                 ckpt_cfg = EasyDict({
                     "output": head_output,

@@ -11,7 +11,7 @@ img_size: 256
 num_frames: 4
 tubelet_size: 2
 patch_size: 16
-checkpoint_path: /home/chrysenberg/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+checkpoint_path: null
 checkpoint_key: ema_encoder
 pool: mean
 
@@ -30,7 +30,7 @@ NF: 4
 VCL: 16
 apply_softmax: true
 data_mean: [0.5, 0.5, 0.5]
-data_path: /mnt/d/Users/Chrysenberg69420/Downloads/DoTA_dataset
+data_path: ./data/dota
 data_std: [0.5, 0.5, 0.5]
 dataset: Dota
 image_shape: [720, 1280]
@@ -43,6 +43,8 @@ class_weights: [0.3, 0.7]
 epochs: 200
 lr: 0.001
 snapshot_interval: 10
+enable_validation: true
+validation_epoch_step: 10
 num_workers: 4
 grad_accum: 1
 amp_dtype: fp16                      # bf16 (AMP mixed-precision), fp16, or fp32 (no AMP)
@@ -52,4 +54,4 @@ horizontal_flip_prob: 0.5
 vertical_flip_prob: 0.0
 
 # --- Output ---------------------------------------------------------------
-output: ./output/vjepa_mamba
+output: ./output
