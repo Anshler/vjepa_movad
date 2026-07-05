@@ -176,6 +176,7 @@ def parse_configs():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config)")
     parser.add_argument("--snapshot_interval", type=int, default=10)
     parser.add_argument("--epoch", type=int, default=-1, help="Resume from (train) or eval (test)")
     parser.add_argument("--enable_validation", action="store_true", default=None,
@@ -207,6 +208,7 @@ def parse_configs():
     _yaml_ckpt = cfg.get("checkpoint_path", None)
     _yaml_data = cfg.get("data_path", "./data/dota")
     _yaml_vcl = cfg.get("VCL", 16)
+    _yaml_batch = cfg.get("batch_size", 8)
 
     cfg.update(vars(args))
 
@@ -226,6 +228,8 @@ def parse_configs():
         cfg.data_path = _yaml_data
     if args.VCL is None:
         cfg.VCL = _yaml_vcl
+    if args.batch_size is None:
+        cfg.batch_size = _yaml_batch
 
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
