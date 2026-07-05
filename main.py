@@ -162,12 +162,12 @@ def _try_build_precomputed_val_loader(data_path: str, batch_size: int, num_worke
 def parse_configs():
     parser = argparse.ArgumentParser(description="V-JEPA 2.1 + MOVAD anomaly detection")
     _DEFAULT_CONFIGS = [
-        #"cfgs/vjepa_v1.yaml",
+        "cfgs/vjepa_v1.yaml",
         "cfgs/vjepa_mamba.yaml",
         "cfgs/vjepa_slotssm.yaml",
-        #"cfgs/vjepa_sparse_slotssm.yaml",
-        #"cfgs/vjepa_slotssm_inv.yaml",
-        #"cfgs/vjepa_sparse_slotssm_inv.yaml",
+        "cfgs/vjepa_sparse_slotssm.yaml",
+        "cfgs/vjepa_slotssm_inv.yaml",
+        "cfgs/vjepa_sparse_slotssm_inv.yaml",
     ]
     parser.add_argument("--config", nargs="+", default=_DEFAULT_CONFIGS,
                         help="YAML config(s). First = master (encoder/data/training/...); "
@@ -184,6 +184,7 @@ def parse_configs():
                         help="Disable validation during training")
     parser.add_argument("--validation_epoch_step", type=int, default=None,
                         help="Validate every N epochs (overrides config)")
+    parser.add_argument("--VCL", type=int, default=None, help="Variational continual learning clip count (overrides config)")
     parser.add_argument("--checkpoint_path", default=None, help="Pretrained encoder checkpoint (overrides config)")
     parser.add_argument("--data_path", default=None, help="Dataset root directory (overrides config)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
@@ -205,6 +206,7 @@ def parse_configs():
     _yaml_val_step = cfg.get("validation_epoch_step", 10)
     _yaml_ckpt = cfg.get("checkpoint_path", None)
     _yaml_data = cfg.get("data_path", "./data/dota")
+    _yaml_vcl = cfg.get("VCL", 16)
 
     cfg.update(vars(args))
 
@@ -222,6 +224,8 @@ def parse_configs():
         cfg.checkpoint_path = _yaml_ckpt
     if args.data_path is None:
         cfg.data_path = _yaml_data
+    if args.VCL is None:
+        cfg.VCL = _yaml_vcl
 
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
