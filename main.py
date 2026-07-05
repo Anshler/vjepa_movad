@@ -184,6 +184,8 @@ def parse_configs():
                         help="Disable validation during training")
     parser.add_argument("--validation_epoch_step", type=int, default=None,
                         help="Validate every N epochs (overrides config)")
+    parser.add_argument("--checkpoint_path", default=None, help="Pretrained encoder checkpoint (overrides config)")
+    parser.add_argument("--data_path", default=None, help="Dataset root directory (overrides config)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
     args = parser.parse_args()
 
@@ -201,6 +203,8 @@ def parse_configs():
     _yaml_workers = cfg.get("num_workers", 0)
     _yaml_enable_val = cfg.get("enable_validation", True)
     _yaml_val_step = cfg.get("validation_epoch_step", 10)
+    _yaml_ckpt = cfg.get("checkpoint_path", None)
+    _yaml_data = cfg.get("data_path", "./data/dota")
 
     cfg.update(vars(args))
 
@@ -214,6 +218,10 @@ def parse_configs():
         cfg.enable_validation = _yaml_enable_val
     if args.validation_epoch_step is None:
         cfg.validation_epoch_step = _yaml_val_step
+    if args.checkpoint_path is None:
+        cfg.checkpoint_path = _yaml_ckpt
+    if args.data_path is None:
+        cfg.data_path = _yaml_data
 
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
