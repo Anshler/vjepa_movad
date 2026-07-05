@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import gc
 import glob
 import json
 import os
@@ -501,11 +502,24 @@ def train(cfg, model, traindata_loader, begin_epoch,
 
         # Validation — free training tensors first to avoid stacking
         if testdata_loader is not None and (e + 1) % validation_epoch_step == 0:
-            torch.cuda.empty_cache()          # flush training tensors before eval
+            # Shut down training DataLoader workers to reclaim CPU RAM.
+            # torch.cuda.empty_cache() only frees GPU VRAM — the worker pool
+            # (num_workers=4) still holds prefetched video batches in system RAM.
+            # Deleting the iterator triggers worker-shutdown; gc.collect() forces
+            # immediate reclamation before eval loads its own data.
+            del loader_iter
+            gc.collect()
+            torch.cuda.empty_cache()
+
             print(f"\n  === Validation at epoch {e+1} ===")
             _evaluate_model(cfg, model, testdata_loader, e + 1, writers=writers)
-            torch.cuda.empty_cache()          # flush eval tensors before next epoch
+
+            # After eval: reclaim eval tensors, then recreate training iterator
+            # for the next epoch.
+            torch.cuda.empty_cache()
+            gc.collect()
             model.train(True)
+            # Training iterator is recreated at the top of the next epoch (line 419)
 
     for w in writers.values():
         w.close()
