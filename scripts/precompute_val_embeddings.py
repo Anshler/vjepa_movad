@@ -96,9 +96,10 @@ def main():
     fb = cfg.NF
 
     # --- Validation dataset ------------------------------------------------
-    # Original evaluation ran on full videos (VCL=None).  To keep that
-    # behaviour, we must use batch_size=1 — full videos have different
-    # lengths and cannot be stacked.
+    # Precomputation encodes one full video at a time — batch_size=1 is
+    # required because each video is saved to its own .pt file and the loop
+    # indexes val_dataset.keys by iteration order.
+    cfg.batch_size = 1
     _, val_loader = setup_dota(
         Dota, cfg, num_workers=cfg.get("num_workers", 4),
         VCL=None, phase="test",

@@ -63,6 +63,8 @@ def pad_collate_videos(batch):
             pad = torch.zeros(max_len - v.shape[0], *v.shape[1:], dtype=v.dtype)
             v = torch.cat([v, pad], dim=0)
         padded.append(v)
+    # data_info arrives as numpy arrays from Dota.__getitem__ — convert to tensors
+    infos = [torch.as_tensor(info) for info in infos]
     return torch.stack(padded, dim=0), torch.stack(infos, dim=0)
 
 
