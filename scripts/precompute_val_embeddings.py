@@ -44,6 +44,10 @@ def parse_args():
                         help="YAML config(s). First = master (encoder + data settings).")
     parser.add_argument("--output", default=None,
                         help="Output directory (default: <data_path>/embedding_val)")
+    parser.add_argument("--data_path", default=None,
+                        help="Dataset root directory (overrides config)")
+    parser.add_argument("--checkpoint_path", default=None,
+                        help="Pretrained encoder checkpoint (overrides config)")
     parser.add_argument("--device", default=None,
                         help="Device override (default: cuda if available)")
     parser.add_argument("--verify", action="store_true",
@@ -57,6 +61,12 @@ def main():
     # --- Load master config ------------------------------------------------
     with open(args.config[0], "r") as f:
         cfg = EasyDict(yaml.safe_load(f))
+
+    # CLI overrides (explicitly passed values win over YAML)
+    if args.data_path is not None:
+        cfg.data_path = args.data_path
+    if args.checkpoint_path is not None:
+        cfg.checkpoint_path = args.checkpoint_path
 
     # Replicate head-config parsing from main.py so build_multi_head_vjepa works
     cfg._head_names = [pathlib.Path(p).stem for p in args.config]
