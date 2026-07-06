@@ -21,7 +21,7 @@ Resume:
 from __future__ import annotations
 
 import argparse
-import datetime
+
 import gc
 import glob
 import json
@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import yaml
 from easydict import EasyDict
-from torch.utils.tensorboard import SummaryWriter
+from movad_core.wandb_utils import init_wandb_for_head
 from tqdm import tqdm
 
 # Ensure the repo root is on sys.path for sibling imports
@@ -279,7 +279,7 @@ def _load_head_state_dict(head, state_dict):
 # Training loop — one encode → N independent temporal trainings
 #
 # Works for 1 head or N heads — same code path either way.
-# Each head has its own optimizer, checkpoint directory, and TensorBoard
+# Each head has its own optimizer, checkpoint directory, and wandb
 # writer.  Losses are never summed — ``.backward()`` flows only through that
 # head's temporal + classifier parameters.  The shared encoder is frozen.
 # ---------------------------------------------------------------------------
@@ -292,7 +292,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
     touches that head's parameters.
 
     If ``testdata_loader`` is provided, validation runs every
-    ``validation_epoch_step`` epochs and metrics are logged to tensorboard.
+    ``validation_epoch_step`` epochs and metrics are logged to wandb.
     """
     head_names = list(model.heads.keys())
 
@@ -302,7 +302,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
     head_cfgs: dict[str, dict] = {}
     criterion: dict[str, torch.nn.Module] = {}
     optimizer: dict[str, torch.optim.Optimizer] = {}
-    writers: dict[str, SummaryWriter] = {}
+    writers: dict[str, object] = {}
     output_dirs: dict[str, str] = {}
     accum_steps: dict[str, int] = {}
     autocast_ctx: dict[str, object] = {}
@@ -323,10 +323,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
         with open(os.path.join(output_dir, "cfg.yml"), "w") as f:
             yaml.dump(head_cfgs[name], f, default_flow_style=False)
 
-        writer = SummaryWriter(
-            os.path.join(output_dir, "tensorboard", f"train_{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}")
-        )
-        writers[name] = writer
+        run = init_wandb_for_head(name, head_cfgs[name], output_dir, begin_epoch)
+        writers[name] = run
 
         # Build head-specific loss
         head_easy = EasyDict(head_cfgs[name])
@@ -349,7 +347,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
     # -------------------------------------------------------------------
     # Per-video temporal loop — identical to single-model version but
     # parameterised by head name so slot diagnostics route to the right
-    # TensorBoard writer.
+    # wandb writer.
     # -------------------------------------------------------------------
     def _run_temporal_loop(head, patches_clips, data_info, fb, v_len, head_name):
         toa_batch = data_info[:, 2]
@@ -424,8 +422,6 @@ def train(cfg, model, traindata_loader, begin_epoch,
 
         n_batches = len(traindata_loader)
         pbar = tqdm(range(n_batches), desc=f"Epoch {e+1}/{cfg.epochs}")
-        global_idx = 0
-
         for j in pbar:
             video_data = torch.swapaxes(video_data, 1, 2)
             v_len = video_data.shape[2]
@@ -463,17 +459,18 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
                 avg_loss = total_loss.item() / max(f_count, 1)
-                writers[name].add_scalar("train/loss_step", avg_loss, global_idx)
+                writers[name].log({"train/loss_step": avg_loss}, step=e + j / n_batches)
                 postfix_parts.append(f"{name}:{avg_loss:.3f}")
 
                 if slot_diag:
                     n = slot_diag.pop("_count", 1)
-                    writers[name].add_scalar("slots/mass_min", slot_diag["mass_min"], global_idx)
-                    writers[name].add_scalar("slots/mass_mean", slot_diag["mass_mean"] / n, global_idx)
-                    writers[name].add_scalar("slots/usage_frac", slot_diag["usage_frac"], global_idx)
+                    writers[name].log({
+                        "slots/mass_min": slot_diag["mass_min"],
+                        "slots/mass_mean": slot_diag["mass_mean"] / n,
+                        "slots/usage_frac": slot_diag["usage_frac"],
+                    }, step=e + j / n_batches)
 
             pbar.set_postfix_str(" ".join(postfix_parts))
-            global_idx += 1
 
             if j < n_batches - 1:
                 video_data = next_video
@@ -483,7 +480,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
         print(f"  Epoch {e+1}/{cfg.epochs}")
         for name in head_names:
             e_loss = epoch_losses[name] / max(epoch_frames[name], 1)
-            writers[name].add_scalar("train/epoch_loss", e_loss, e)
+            writers[name].log({"train/epoch_loss": e_loss}, step=e)
             print(f"    {name}: avg_loss={e_loss:.4f}  ({epoch_frames[name]} frames)")
 
         # Checkpoint
@@ -495,6 +492,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                         "epoch": e,
                         "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
                         "optimizer_state_dict": optimizer[name].state_dict(),
+                        "wandb_run_id": writers[name].id,
                     },
                     ckpt_path,
                 )
@@ -521,8 +519,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
             model.train(True)
             # Training iterator is recreated at the top of the next epoch (line 419)
 
-    for w in writers.values():
-        w.close()
+    for run in writers.values():
+        run.finish()
 
     # Save final checkpoint if not already saved at the last epoch
     if cfg.epochs % cfg.snapshot_interval != 0:
@@ -533,6 +531,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     "epoch": cfg.epochs - 1,
                     "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
                     "optimizer_state_dict": optimizer[name].state_dict(),
+                    "wandb_run_id": writers[name].id,
                 },
                 ckpt_path,
             )
@@ -553,8 +552,8 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
     model : MultiHeadVJEPA
     testdata_loader : DataLoader
     epoch : int — current epoch number (used for result filenames and logging step)
-    writers : dict[str, SummaryWriter] | None — if provided, metrics are logged
-              to tensorboard under ``val/<metric>`` for each head.
+    writers : dict[str, object] | None — if provided, metrics are logged
+              to wandb under ``val/<metric>`` for each head.
 
     Returns
     -------
@@ -685,13 +684,15 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
             "f1_mean": f1_mean, "accuracy": accuracy,
         }
 
-        # Log to tensorboard if writers provided (train-time validation)
+        # Log to wandb if writers provided (train-time validation)
         if writers is not None and name in writers:
-            writers[name].add_scalar("val/auc_roc", auc_roc, epoch)
-            writers[name].add_scalar("val/auc_pr", auc_pr, epoch)
-            writers[name].add_scalar("val/f1", f1_one, epoch)
-            writers[name].add_scalar("val/f1_mean", f1_mean, epoch)
-            writers[name].add_scalar("val/accuracy", accuracy, epoch)
+            writers[name].log({
+                "val/auc_roc": auc_roc,
+                "val/auc_pr": auc_pr,
+                "val/f1": f1_one,
+                "val/f1_mean": f1_mean,
+                "val/accuracy": accuracy,
+            }, step=epoch)
 
         print(f"  [{name}] validation results (epoch {epoch}):")
         print_results(cfg, auc_roc, auc_pr, f1_one, f1_mean, accuracy,
