@@ -7,6 +7,7 @@ Usage (from WSL):
     cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
     python tests/benchmark_latency.py
     python tests/benchmark_latency.py --amp fp32
+    python tests/benchmark_latency.py --checkpoint ~/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
 """
 from __future__ import annotations
 
@@ -81,6 +82,8 @@ def measure_latency(model, x, steps, amp_dtype=None):
 parser = argparse.ArgumentParser()
 parser.add_argument("--amp", default=_DEFAULT_AMP, choices=list(_AMP_CHOICES),
                     help=f"AMP dtype (default: {_DEFAULT_AMP})")
+parser.add_argument("--checkpoint", default=None,
+                    help="Path to a pretrained V-JEPA checkpoint (.pt)")
 args = parser.parse_args()
 amp_dtype = _AMP_CHOICES[args.amp]
 
@@ -104,6 +107,8 @@ for name, tag in CONFIGS:
 
     cfg = load_cfg(name)
     cfg.model_name = "vit_base"
+    if args.checkpoint is not None:
+        cfg.checkpoint_path = args.checkpoint
     model = build_cls_vjepa(cfg)
     model.eval()
 
