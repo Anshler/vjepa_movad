@@ -241,7 +241,7 @@ def parse_configs():
     # Build head configs — always, even for 1 head
     import pathlib
 
-    cfg._head_names = [pathlib.Path(p).stem for p in args.config]
+    cfg._head_names = [f"{pathlib.Path(p).stem}_VCL_{cfg.VCL}" for p in args.config]
     head_cfgs_flat = []
     for name, hc in zip(cfg._head_names, all_cfgs):
         entry = dict(hc)
