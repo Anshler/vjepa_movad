@@ -241,8 +241,14 @@ class MambaTemporalModel(nn.Module):
         # Align cached state tensors to input dtype so that the
         # causal_conv1d_update CUDA kernel doesn't reject them
         # (it requires conv_state.scalar_type() == input_type).
+        # States are stored as (conv_state, ssm_state) tuples keyed by layer_idx.
         for k, v in cache.key_value_memory_dict.items():
-            if isinstance(v, torch.Tensor) and v.dtype != x.dtype:
+            if isinstance(v, tuple):
+                cache.key_value_memory_dict[k] = tuple(
+                    t.to(dtype=x.dtype) if isinstance(t, torch.Tensor) and t.dtype != x.dtype else t
+                    for t in v
+                )
+            elif isinstance(v, torch.Tensor) and v.dtype != x.dtype:
                 cache.key_value_memory_dict[k] = v.to(dtype=x.dtype)
         h = x.unsqueeze(1)
         for blk, norm in zip(self.blocks, self.norms):
