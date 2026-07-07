@@ -192,6 +192,7 @@ def parse_configs():
     parser.add_argument("--checkpoint_path", default=None, help="Pretrained encoder checkpoint (overrides config)")
     parser.add_argument("--data_path", default=None, help="Dataset root directory (overrides config)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
+    parser.add_argument("--val_batch_size", type=int, default=2, help="Batch size for validation/test (default: 2)")
     args = parser.parse_args()
 
     # Load all configs
@@ -749,7 +750,7 @@ if __name__ == "__main__":
                 print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
             else:
                 test_cfg = copy.deepcopy(cfg)
-                test_cfg.batch_size = cfg.get("val_batch_size", 2)
+                test_cfg.batch_size = cfg.val_batch_size
                 _, testdata_loader = setup_dota(
                     Dota, test_cfg, num_workers=cfg.num_workers,
                     VCL=None, phase="test",
@@ -763,7 +764,7 @@ if __name__ == "__main__":
             print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
         else:
             test_cfg = copy.deepcopy(cfg)
-            test_cfg.batch_size = cfg.get("val_batch_size", 2)
+            test_cfg.batch_size = cfg.val_batch_size
             _, testdata_loader = setup_dota(
                 Dota, test_cfg, num_workers=cfg.num_workers,
                 VCL=None, phase="test",
