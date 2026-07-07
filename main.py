@@ -302,7 +302,6 @@ def train(cfg, model, traindata_loader, begin_epoch,
     head_cfgs: dict[str, dict] = {}
     criterion: dict[str, torch.nn.Module] = {}
     optimizer: dict[str, torch.optim.Optimizer] = {}
-    writers: dict[str, object] = {}
     output_dirs: dict[str, str] = {}
     accum_steps: dict[str, int] = {}
     autocast_ctx: dict[str, object] = {}
@@ -323,9 +322,6 @@ def train(cfg, model, traindata_loader, begin_epoch,
         with open(os.path.join(output_dir, "cfg.yml"), "w") as f:
             yaml.dump(head_cfgs[name], f, default_flow_style=False)
 
-        run = init_wandb_for_head(name, head_cfgs[name], output_dir, begin_epoch)
-        writers[name] = run
-
         # Build head-specific loss
         head_easy = EasyDict(head_cfgs[name])
         head_easy.device = cfg.device
@@ -343,6 +339,20 @@ def train(cfg, model, traindata_loader, begin_epoch,
         _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
         autocast_ctx[name] = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
         accum_steps[name] = head_cfgs[name].get("grad_accum", 1)
+
+    # -------------------------------------------------------------------
+    # Shared wandb writer — ONE run for all heads with metric names
+    # prefixed by head.  wandb.init(reinit=True) finishes the previous
+    # run, so per-head writers silently killed each other (head 2's init
+    # would finish head 1's run → "Run is finished" on next log).
+    # -------------------------------------------------------------------
+    merged_cfg = dict(cfg)
+    merged_cfg["heads"] = list(head_names)
+    shared_writer = init_wandb_for_head(
+        "-".join(head_names) if len(head_names) > 1 else head_names[0],
+        merged_cfg, cfg.output, begin_epoch,
+    )
+    _wandb_run_id = shared_writer.id  # stored once, used for all head checkpoints
 
     # -------------------------------------------------------------------
     # Per-video temporal loop — identical to single-model version but
@@ -459,15 +469,15 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
                 avg_loss = total_loss.item() / max(f_count, 1)
-                writers[name].log({"train/loss_step": avg_loss}, step=e + j / n_batches)
+                shared_writer.log({f"{name}/train/loss_step": avg_loss}, step=e + j / n_batches)
                 postfix_parts.append(f"{name}:{avg_loss:.3f}")
 
                 if slot_diag:
                     n = slot_diag.pop("_count", 1)
-                    writers[name].log({
-                        "slots/mass_min": slot_diag["mass_min"],
-                        "slots/mass_mean": slot_diag["mass_mean"] / n,
-                        "slots/usage_frac": slot_diag["usage_frac"],
+                    shared_writer.log({
+                        f"{name}/slots/mass_min": slot_diag["mass_min"],
+                        f"{name}/slots/mass_mean": slot_diag["mass_mean"] / n,
+                        f"{name}/slots/usage_frac": slot_diag["usage_frac"],
                     }, step=e + j / n_batches)
 
             pbar.set_postfix_str(" ".join(postfix_parts))
@@ -480,7 +490,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
         print(f"  Epoch {e+1}/{cfg.epochs}")
         for name in head_names:
             e_loss = epoch_losses[name] / max(epoch_frames[name], 1)
-            writers[name].log({"train/epoch_loss": e_loss}, step=e)
+            shared_writer.log({f"{name}/train/epoch_loss": e_loss}, step=e)
             print(f"    {name}: avg_loss={e_loss:.4f}  ({epoch_frames[name]} frames)")
 
         # Checkpoint
@@ -492,7 +502,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                         "epoch": e,
                         "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
                         "optimizer_state_dict": optimizer[name].state_dict(),
-                        "wandb_run_id": writers[name].id,
+                        "wandb_run_id": _wandb_run_id,
                     },
                     ckpt_path,
                 )
@@ -510,7 +520,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
             torch.cuda.empty_cache()
 
             print(f"\n  === Validation at epoch {e+1} ===")
-            _evaluate_model(cfg, model, testdata_loader, e + 1, writers=writers)
+            _evaluate_model(cfg, model, testdata_loader, e + 1, writer=shared_writer)
 
             # After eval: reclaim eval tensors, then recreate training iterator
             # for the next epoch.
@@ -519,8 +529,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
             model.train(True)
             # Training iterator is recreated at the top of the next epoch (line 419)
 
-    for run in writers.values():
-        run.finish()
+    shared_writer.finish()
 
     # Save final checkpoint if not already saved at the last epoch
     if cfg.epochs % cfg.snapshot_interval != 0:
@@ -531,7 +540,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     "epoch": cfg.epochs - 1,
                     "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
                     "optimizer_state_dict": optimizer[name].state_dict(),
-                    "wandb_run_id": writers[name].id,
+                    "wandb_run_id": _wandb_run_id,
                 },
                 ckpt_path,
             )
@@ -543,7 +552,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
 # Used by both train-time validation and standalone testing.
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
+def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
     """Run validation/test inference and compute metrics for all heads.
 
     Parameters
@@ -552,8 +561,8 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
     model : MultiHeadVJEPA
     testdata_loader : DataLoader
     epoch : int — current epoch number (used for result filenames and logging step)
-    writers : dict[str, object] | None — if provided, metrics are logged
-              to wandb under ``val/<metric>`` for each head.
+    writer : wandb.Run | None — if provided, metrics are logged to wandb
+             under ``<head>/val/<metric>`` for each head.
 
     Returns
     -------
@@ -684,15 +693,18 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
             "f1_mean": f1_mean, "accuracy": accuracy,
         }
 
-        # Log to wandb if writers provided (train-time validation)
-        if writers is not None and name in writers:
-            writers[name].log({
-                "val/auc_roc": auc_roc,
-                "val/auc_pr": auc_pr,
-                "val/f1": f1_one,
-                "val/f1_mean": f1_mean,
-                "val/accuracy": accuracy,
-            }, step=epoch)
+        # Log to wandb if writer provided (train-time validation)
+        if writer is not None:
+            try:
+                writer.log({
+                    f"{name}/val/auc_roc": auc_roc,
+                    f"{name}/val/auc_pr": auc_pr,
+                    f"{name}/val/f1": f1_one,
+                    f"{name}/val/f1_mean": f1_mean,
+                    f"{name}/val/accuracy": accuracy,
+                }, step=epoch)
+            except Exception:
+                pass
 
         print(f"  [{name}] validation results (epoch {epoch}):")
         print_results(cfg, auc_roc, auc_pr, f1_one, f1_mean, accuracy,
@@ -706,7 +718,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writers=None):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def test(cfg, model, testdata_loader, epoch):
-    return _evaluate_model(cfg, model, testdata_loader, epoch, writers=None)
+    return _evaluate_model(cfg, model, testdata_loader, epoch, writer=None)
 
 
 # ---------------------------------------------------------------------------
