@@ -21,6 +21,7 @@ Resume:
 from __future__ import annotations
 
 import argparse
+import copy
 
 import gc
 import glob
@@ -490,7 +491,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
         print(f"  Epoch {e+1}/{cfg.epochs}")
         for name in head_names:
             e_loss = epoch_losses[name] / max(epoch_frames[name], 1)
-            shared_writer.log({f"{name}/train/epoch_loss": e_loss}, step=e)
+            shared_writer.log({f"{name}/train/epoch_loss": e_loss}, step=(e + 1) * 1000)
             print(f"    {name}: avg_loss={e_loss:.4f}  ({epoch_frames[name]} frames)")
 
         # Checkpoint
@@ -702,7 +703,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
                     f"{name}/val/f1": f1_one,
                     f"{name}/val/f1_mean": f1_mean,
                     f"{name}/val/accuracy": accuracy,
-                }, step=epoch)
+                }, step=epoch * 1000)
             except Exception:
                 pass
 
@@ -747,8 +748,10 @@ if __name__ == "__main__":
             if testdata_loader is not None:
                 print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
             else:
+                test_cfg = copy.deepcopy(cfg)
+                test_cfg.batch_size = max(1, cfg.batch_size // 4)
                 _, testdata_loader = setup_dota(
-                    Dota, cfg, num_workers=cfg.num_workers,
+                    Dota, test_cfg, num_workers=cfg.num_workers,
                     VCL=None, phase="test",
                 )
                 print("  Precomputed embeddings not found — using raw video for validation")
@@ -759,8 +762,10 @@ if __name__ == "__main__":
         if testdata_loader is not None:
             print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
         else:
+            test_cfg = copy.deepcopy(cfg)
+            test_cfg.batch_size = max(1, cfg.batch_size // 4)
             _, testdata_loader = setup_dota(
-                Dota, cfg, num_workers=cfg.num_workers,
+                Dota, test_cfg, num_workers=cfg.num_workers,
                 VCL=None, phase="test",
             )
             print("  Precomputed embeddings not found — using raw video for testing")
