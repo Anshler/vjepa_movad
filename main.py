@@ -749,7 +749,7 @@ if __name__ == "__main__":
                 print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
             else:
                 test_cfg = copy.deepcopy(cfg)
-                test_cfg.batch_size = max(1, cfg.batch_size // 4)
+                test_cfg.batch_size = cfg.get("val_batch_size", 2)
                 _, testdata_loader = setup_dota(
                     Dota, test_cfg, num_workers=cfg.num_workers,
                     VCL=None, phase="test",
@@ -763,7 +763,7 @@ if __name__ == "__main__":
             print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
         else:
             test_cfg = copy.deepcopy(cfg)
-            test_cfg.batch_size = max(1, cfg.batch_size // 4)
+            test_cfg.batch_size = cfg.get("val_batch_size", 2)
             _, testdata_loader = setup_dota(
                 Dota, test_cfg, num_workers=cfg.num_workers,
                 VCL=None, phase="test",
