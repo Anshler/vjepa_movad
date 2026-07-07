@@ -469,7 +469,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
                 avg_loss = total_loss.item() / max(f_count, 1)
-                shared_writer.log({f"{name}/train/loss_step": avg_loss}, step=e + j / n_batches)
+                shared_writer.log({f"{name}/train/loss_step": avg_loss}, step=e * 1000 + int(j * 1000 / n_batches))
                 postfix_parts.append(f"{name}:{avg_loss:.3f}")
 
                 if slot_diag:
@@ -478,7 +478,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
                         f"{name}/slots/mass_min": slot_diag["mass_min"],
                         f"{name}/slots/mass_mean": slot_diag["mass_mean"] / n,
                         f"{name}/slots/usage_frac": slot_diag["usage_frac"],
-                    }, step=e + j / n_batches)
+                    }, step=e * 1000 + int(j * 1000 / n_batches))
 
             pbar.set_postfix_str(" ".join(postfix_parts))
 
