@@ -286,7 +286,8 @@ def _load_head_state_dict(head, state_dict):
 # head's temporal + classifier parameters.  The shared encoder is frozen.
 # ---------------------------------------------------------------------------
 def train(cfg, model, traindata_loader, begin_epoch,
-          testdata_loader=None, validation_epoch_step=10):
+          testdata_loader=None, validation_epoch_step=10,
+          opt_state_dicts=None):
     """Train a MultiHeadVJEPA: encode once per batch, then loop heads sequentially.
 
     Heads are trained **independently** — different losses, different
@@ -336,6 +337,11 @@ def train(cfg, model, traindata_loader, begin_epoch,
             None,
         )
         optimizer[name] = opt
+
+        # Restore optimizer state when resuming from a checkpoint
+        opt_sd = (opt_state_dicts or {}).get(name)
+        if opt_sd is not None:
+            opt.load_state_dict(opt_sd)
 
         _amp_cfg = head_cfgs[name].get("amp_dtype", "fp32")
         _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
@@ -776,6 +782,7 @@ if __name__ == "__main__":
     model = build_multi_head_vjepa(cfg)
 
     # Resume / load checkpoints per head
+    opt_state_dicts = {}
     if cfg.epoch != -1:
         for name, head in model.heads.items():
             head_output = os.path.join(cfg.output, name)
@@ -787,6 +794,7 @@ if __name__ == "__main__":
                 })
                 ckpt = movad_utils.load_checkpoint(ckpt_cfg)
                 _load_head_state_dict(head, ckpt["model_state_dict"])
+                opt_state_dicts[name] = ckpt.get("optimizer_state_dict")
                 ep = ckpt["epoch"] + 1
                 print(f"  [{name}] resumed from epoch {ep}")
             except FileNotFoundError:
@@ -799,7 +807,8 @@ if __name__ == "__main__":
             val_step = min(val_step, cfg.epochs)
         train(cfg, model, traindata_loader, epoch_val,
               testdata_loader=testdata_loader,
-              validation_epoch_step=val_step)
+              validation_epoch_step=val_step,
+              opt_state_dicts=opt_state_dicts)
 
     elif cfg.phase == "test":
         if cfg.epoch == -1:
