@@ -478,7 +478,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
                 avg_loss = total_loss.item() / max(f_count, 1)
-                shared_writer.log({f"{name}/train/loss_step": avg_loss}, step=e * 1000 + int(j * 1000 / n_batches))
+                shared_writer.log({f"{name}/train/loss_step": avg_loss},
+                                  step=e * 1000 + int(j * 1000 / n_batches))
                 postfix_parts.append(f"{name}:{avg_loss:.3f}")
 
                 if slot_diag:
@@ -499,7 +500,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
         print(f"  Epoch {e+1}/{cfg.epochs}")
         for name in head_names:
             e_loss = epoch_losses[name] / max(epoch_frames[name], 1)
-            shared_writer.log({f"{name}/train/epoch_loss": e_loss}, step=(e + 1) * 1000)
+            shared_writer.log({f"{name}/train/epoch_loss": e_loss}, step=e * 1000 + 999)
             print(f"    {name}: avg_loss={e_loss:.4f}  ({epoch_frames[name]} frames)")
 
         # Checkpoint
@@ -711,7 +712,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
                     f"{name}/val/f1": f1_one,
                     f"{name}/val/f1_mean": f1_mean,
                     f"{name}/val/accuracy": accuracy,
-                }, step=epoch * 1000)
+                }, step=epoch * 1000 - 1)
             except Exception:
                 pass
 
