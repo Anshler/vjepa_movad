@@ -35,6 +35,7 @@ def init_wandb_for_head(
     head_cfg: dict,
     output_dir: str,
     begin_epoch: int,
+    resume_id: str | None = None,
 ) -> "wandb.run":
     """Create or resume a wandb run for one temporal-model head.
 
@@ -48,9 +49,15 @@ def init_wandb_for_head(
     output_dir : str
         Head output directory (contains ``checkpoints/``).
     begin_epoch : int
-        Epoch the training loop will start at.  If ``> 0``, we look for a
-        checkpoint at that epoch and try to extract a stored ``wandb_run_id``
-        so the run graph continues as one uninterrupted line.
+        Epoch the training loop will start at.  If ``> 0`` and *resume_id*
+        is not provided, we look for a checkpoint at that epoch and try to
+        extract a stored ``wandb_run_id`` so the run graph continues as one
+        uninterrupted line.
+    resume_id : str | None
+        Explicit wandb run ID to resume.  Takes precedence over auto-detection
+        from a checkpoint file.  Use when the caller already loaded the
+        checkpoint (e.g. in a multi-head setup where the checkpoint lives in a
+        per-head subdirectory).
 
     Returns
     -------
@@ -69,8 +76,7 @@ def init_wandb_for_head(
         os.path.dirname(output_dir.rstrip("/\\"))
     )  # e.g. "2025-07-06_experiment"
 
-    resume_id = None
-    if begin_epoch > 0:
+    if resume_id is None and begin_epoch > 0:
         ckpt_path = os.path.join(
             output_dir, "checkpoints", f"model-{begin_epoch:02d}.pt"
         )

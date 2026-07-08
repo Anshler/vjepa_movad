@@ -287,7 +287,7 @@ def _load_head_state_dict(head, state_dict):
 # ---------------------------------------------------------------------------
 def train(cfg, model, traindata_loader, begin_epoch,
           testdata_loader=None, validation_epoch_step=10,
-          opt_state_dicts=None):
+          opt_state_dicts=None, wandb_resume_id=None):
     """Train a MultiHeadVJEPA: encode once per batch, then loop heads sequentially.
 
     Heads are trained **independently** — different losses, different
@@ -359,6 +359,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
     shared_writer = init_wandb_for_head(
         "-".join(head_names) if len(head_names) > 1 else head_names[0],
         merged_cfg, cfg.output, begin_epoch,
+        resume_id=wandb_resume_id,
     )
     _wandb_run_id = shared_writer.id  # stored once, used for all head checkpoints
 
@@ -783,6 +784,7 @@ if __name__ == "__main__":
 
     # Resume / load checkpoints per head
     opt_state_dicts = {}
+    wandb_resume_id = None
     if cfg.epoch != -1:
         for name, head in model.heads.items():
             head_output = os.path.join(cfg.output, name)
@@ -795,6 +797,8 @@ if __name__ == "__main__":
                 ckpt = movad_utils.load_checkpoint(ckpt_cfg)
                 _load_head_state_dict(head, ckpt["model_state_dict"])
                 opt_state_dicts[name] = ckpt.get("optimizer_state_dict")
+                if wandb_resume_id is None:
+                    wandb_resume_id = ckpt.get("wandb_run_id")
                 ep = ckpt["epoch"] + 1
                 print(f"  [{name}] resumed from epoch {ep}")
             except FileNotFoundError:
@@ -808,7 +812,8 @@ if __name__ == "__main__":
         train(cfg, model, traindata_loader, epoch_val,
               testdata_loader=testdata_loader,
               validation_epoch_step=val_step,
-              opt_state_dicts=opt_state_dicts)
+              opt_state_dicts=opt_state_dicts,
+              wandb_resume_id=wandb_resume_id)
 
     elif cfg.phase == "test":
         if cfg.epoch == -1:
