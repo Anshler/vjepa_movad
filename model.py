@@ -195,6 +195,21 @@ def _weights_init(m):
 
 
 # ===========================================================================
+# Temporal model: identity (no temporal modelling — pure per-frame MLP probe)
+# ===========================================================================
+class NoTemporalModel(nn.Module):
+    """Identity passthrough that returns no state.
+
+    Used for diagnostic linear probing — replaces any recurrent/SSM model so
+    each frame is classified independently.  If features carry discriminative
+    signal, even this simple per-frame MLP will beat random.
+    """
+
+    def forward(self, x, state=None):
+        return x, None
+
+
+# ===========================================================================
 # Temporal model: LSTM
 # ===========================================================================
 class LSTMTemporalModel(nn.Module):
@@ -697,6 +712,8 @@ class ClsVJEPA(nn.Module):
                 d_state=mamba_d_state, d_conv=mamba_d_conv,
                 num_blocks=rnn_cell_num, mamba_version=mamba_version,
             )
+        elif temporal_model == "none":
+            self.temporal = NoTemporalModel()
         else:
             raise ValueError(f"Unknown temporal_model: {temporal_model}")
 

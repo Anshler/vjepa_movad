@@ -45,7 +45,8 @@ def init_wandb_for_head(
         Head name (e.g. ``"vjepa_mamba"``).
     head_cfg : dict
         Full resolved config for this head — logged as wandb config for
-        reproducibility.
+        reproducibility.  Supports ``wandb_mode: "disabled"`` to skip wandb
+        entirely (returns a no-op wrapper).
     output_dir : str
         Head output directory (contains ``checkpoints/``).
     begin_epoch : int
@@ -68,6 +69,10 @@ def init_wandb_for_head(
     import wandb
 
     _ensure_logged_in()
+
+    wandb_mode = head_cfg.get("wandb_mode", "online")
+    if wandb_mode == "disabled":
+        return wandb.init(mode="disabled", project="movad")
 
     # Derive a project-group label from the parent output directory so that
     # runs from the same CLI invocation are visually clustered in the dashboard.

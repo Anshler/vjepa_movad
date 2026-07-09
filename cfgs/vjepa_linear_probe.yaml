@@ -1,0 +1,61 @@
+# --------------------------------------------------------------------
+# V-JEPA 2.1 + MOVAD — DIAGNOSTIC LINEAR PROBE
+#
+# Replaces the temporal model with an identity (NoTemporalModel) so
+# each frame is classified independently via a 3-layer MLP:
+#   bn(embed_dim) → lin1(embed_dim→dim_latent) → relu → lin2 → relu → lin3→2
+#
+# No recurrence, no SSM, no temporal context between frames.
+# If the frozen V-JEPA features contain ANY discriminative signal for
+# normal vs. anomaly, this probe will exceed AUC 0.55 within 5-10 epochs.
+# If it can't, the features are the bottleneck — no temporal model will help.
+# --------------------------------------------------------------------
+
+# --- V-JEPA 2.1 encoder ---------------------------------------------------
+model_name: vit_base
+img_size: 256
+num_frames: 4
+tubelet_size: 2
+patch_size: 16
+checkpoint_path: null
+checkpoint_key: ema_encoder
+pool: mean
+
+# --- Temporal model -------------------------------------------------------
+temporal_model: none                 # <-- no recurrence, pure per-frame MLP
+dim_latent: 1024
+dropout: 0.3
+
+# --- Data -----------------------------------------------------------------
+NF: 4
+VCL: 16
+apply_softmax: true
+data_mean: [0.5, 0.5, 0.5]
+data_path: ./data/dota
+data_std: [0.5, 0.5, 0.5]
+dataset: Dota
+image_shape: [720, 1280]
+input_shape: [256, 256]
+FPS: 10
+
+# --- Training -------------------------------------------------------------
+batch_size: 8
+class_weights: [0.3, 0.7]
+epochs: 30
+lr: 0.0001
+snapshot_interval: 5
+enable_validation: true
+validation_epoch_step: 5
+num_workers: 4
+grad_accum: 1
+amp_dtype: fp16
+
+# --- Augmentation ---------------------------------------------------------
+horizontal_flip_prob: 0.5
+vertical_flip_prob: 0.0
+
+# --- Logging --------------------------------------------------------------
+wandb_mode: disabled                   # "online" | "offline" | "disabled"
+
+# --- Output ---------------------------------------------------------------
+output: ./output
