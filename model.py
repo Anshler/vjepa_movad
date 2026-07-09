@@ -650,11 +650,13 @@ class ClsVJEPA(nn.Module):
         eps_random: float = 0.0,
         # Inverted attention (SlotSSM reference repo style)
         use_inverted_attention: bool = False,
+        train_encoder: bool = False,
         verbose: bool = True,
     ):
         super().__init__()
         self.encoder = encoder
         self.temporal_type = temporal_model
+        self.train_encoder = train_encoder
 
         # ---- Slot-based path ------------------------------------------------
         if temporal_model in ("slotssm", "sparse_slotssm"):
@@ -747,7 +749,9 @@ class ClsVJEPA(nn.Module):
         enc = self.encoder.encoder
         N_patches = (num_frames // enc.tubelet_size) * (H // enc.patch_size) * (W // enc.patch_size)
 
-        with torch.no_grad():
+        # When training the encoder, let gradients flow; otherwise freeze
+        ctx = torch.no_grad() if not self.train_encoder else torch.enable_grad()
+        with ctx:
             patches = self.encoder(mega_batch, return_patches=True)     # [B * n_clips, N_patches, embed_dim]
 
         patches = patches.view(B, n_clips, N_patches, -1)               # [B, n_clips, N_patches, embed_dim]
@@ -812,12 +816,16 @@ class ClsVJEPA(nn.Module):
 # heads trained on the same encoded features from a single ViT pass.
 # ===========================================================================
 class MultiHeadVJEPA(nn.Module):
-    """One frozen V-JEPA encoder → multiple temporal + classifier heads.
+    """One V-JEPA encoder → multiple temporal + classifier heads.
 
     Each head trains independently (its own optimizer, checkpoint, and
     TensorBoard writer).  The encoder runs *once* per batch and the resulting
     patch features are reused by all heads.  Losses are never summed — each
     head's ``.backward()`` flows only through its own parameters.
+
+    When ``train_encoder=True`` the encoder is unfrozen and trained jointly.
+    This mode assumes a **single head** — the encoder gradients come from one
+    temporal model only.
 
     Usage
     -----
@@ -834,9 +842,22 @@ class MultiHeadVJEPA(nn.Module):
     >>>     opt.step()
     """
 
-    def __init__(self, encoder: VJEPA2Encoder, heads_configs: list[dict]):
+    def __init__(self, encoder: VJEPA2Encoder, heads_configs: list[dict],
+                 train_encoder: bool = False):
         super().__init__()
         self.encoder = encoder
+        self.train_encoder = train_encoder
+
+        if self.train_encoder:
+            if len(heads_configs) > 1:
+                raise ValueError(
+                    f"train_encoder=True only supports a single head, got {len(heads_configs)}. "
+                    "Multiple heads would produce conflicting encoder gradients."
+                )
+            # load_pretrained_encoder() froze these — reverse it
+            for p in self.encoder.parameters():
+                p.requires_grad = True
+
         self.heads = nn.ModuleDict()
         self.head_configs: dict[str, dict] = {}
 
@@ -865,13 +886,15 @@ class MultiHeadVJEPA(nn.Module):
                 eps_random=head_cfg.get("eps_random", 0.0),
                 use_inverted_attention=head_cfg.get("use_inverted_attention", False),
                 verbose=False,
+                train_encoder=train_encoder,
             )
 
         # Summarise
-        frozen = _count_frozen(self.encoder)
+        enc_params = sum(p.numel() for p in self.encoder.parameters())
         total_trainable = 0
+        enc_label = "Trainable" if self.train_encoder else "Frozen"
         print(f"\n[MultiHeadVJEPA] {len(self.heads)} heads — shared encoder, independent temporal models")
-        print(f"  Frozen (encoder): {frozen / 1e6:.1f}M")
+        print(f"  {enc_label} (encoder): {enc_params / 1e6:.1f}M")
         for name, head in self.heads.items():
             tp = _count(head)
             total_trainable += tp
@@ -880,16 +903,19 @@ class MultiHeadVJEPA(nn.Module):
         print(f"  Total trainable (all heads): {total_trainable / 1e6:.2f}M")
 
     def train(self, mode: bool = True):
-        """Set training mode — temporal heads follow ``mode``, encoder stays eval."""
+        """Set training mode — temporal heads follow ``mode``, encoder stays eval
+        unless ``train_encoder=True``."""
         super().train(mode)
-        self.encoder.eval()
+        if not self.train_encoder:
+            self.encoder.eval()
         return self
 
     def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Run the frozen ViT once over all stride-1 clips in one batch.
+        """Run the ViT encoder once over all stride-1 clips in one batch.
 
         Delegates to the first head's :meth:`ClsVJEPA.encode_video_clips`
         (all heads share the same encoder, so the output is identical).
+        Gradients flow through the encoder when ``train_encoder=True``.
 
         Returns ``[B, n_clips, N_patches, embed_dim]`` — raw patch tokens.
         Standard-path heads call ``.mean(dim=2)`` on this; slot-based heads
@@ -952,5 +978,8 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
         merged = dict(hc)   # full YAML from that config file
         head_configs.append(merged)
 
-    model = MultiHeadVJEPA(encoder=encoder, heads_configs=head_configs).to(cfg.device)
+    model = MultiHeadVJEPA(
+        encoder=encoder, heads_configs=head_configs,
+        train_encoder=cfg.get("train_encoder", False),
+    ).to(cfg.device)
     return model

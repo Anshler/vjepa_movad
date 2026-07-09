@@ -193,6 +193,8 @@ def parse_configs():
     parser.add_argument("--data_path", default=None, help="Dataset root directory (overrides config)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
     parser.add_argument("--val_batch_size", type=int, default=2, help="Batch size for validation/test (default: 2)")
+    parser.add_argument("--train_encoder", action="store_true", default=False,
+                        help="Unfreeze the V-JEPA encoder and train it jointly with the temporal head(s)")
     args = parser.parse_args()
 
     # Load all configs
@@ -267,8 +269,10 @@ def set_deterministic(seed: int):
 # ---------------------------------------------------------------------------
 # Checkpoint helpers — strip frozen encoder weights (saves ~600MB per ckpt)
 # ---------------------------------------------------------------------------
-def _head_state_dict_without_encoder(head):
-    """Return ``head.state_dict()`` excluding the shared frozen encoder weights."""
+def _head_state_dict_without_encoder(head, train_encoder: bool = False):
+    """Return ``head.state_dict()``, excluding encoder weights unless training them."""
+    if train_encoder:
+        return head.state_dict()
     return {k: v for k, v in head.state_dict().items() if not k.startswith("encoder.")}
 
 
@@ -510,7 +514,9 @@ def train(cfg, model, traindata_loader, begin_epoch,
                 torch.save(
                     {
                         "epoch": e,
-                        "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
+                        "model_state_dict": _head_state_dict_without_encoder(
+                            model.heads[name], train_encoder=cfg.train_encoder
+                        ),
                         "optimizer_state_dict": optimizer[name].state_dict(),
                         "wandb_run_id": _wandb_run_id,
                     },
@@ -548,7 +554,9 @@ def train(cfg, model, traindata_loader, begin_epoch,
             torch.save(
                 {
                     "epoch": cfg.epochs - 1,
-                    "model_state_dict": _head_state_dict_without_encoder(model.heads[name]),
+                    "model_state_dict": _head_state_dict_without_encoder(
+                        model.heads[name], train_encoder=cfg.train_encoder
+                    ),
                     "optimizer_state_dict": optimizer[name].state_dict(),
                     "wandb_run_id": _wandb_run_id,
                 },
@@ -750,20 +758,31 @@ if __name__ == "__main__":
             VCL=cfg.get("VCL", None), phase="train",
         )
 
-        # Validation loader — precomputed embeddings if available, else raw video
+        # Validation loader — precomputed embeddings if available, else raw video.
+        # When training the encoder, precomputed embeddings are stale (encoder
+        # changes every epoch) — always use raw video.
         testdata_loader = None
         if cfg.get("enable_validation", False):
-            testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.val_batch_size, 1)
-            if testdata_loader is not None:
-                print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
-            else:
+            if cfg.get("train_encoder", False):
                 test_cfg = copy.deepcopy(cfg)
                 test_cfg.batch_size = cfg.val_batch_size
                 _, testdata_loader = setup_dota(
                     Dota, test_cfg, num_workers=cfg.num_workers,
                     VCL=None, phase="test",
                 )
-                print("  Precomputed embeddings not found — using raw video for validation")
+                print("  train_encoder=True — using raw video for validation (precomputed is stale)")
+            else:
+                testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.val_batch_size, 1)
+                if testdata_loader is not None:
+                    print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
+                else:
+                    test_cfg = copy.deepcopy(cfg)
+                    test_cfg.batch_size = cfg.val_batch_size
+                    _, testdata_loader = setup_dota(
+                        Dota, test_cfg, num_workers=cfg.num_workers,
+                        VCL=None, phase="test",
+                    )
+                    print("  Precomputed embeddings not found — using raw video for validation")
 
     elif cfg.phase == "test":
         traindata_loader = None

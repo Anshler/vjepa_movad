@@ -156,9 +156,8 @@ class VJEPA2Encoder(nn.Module):
         # Register encoder so .to(device)/.to(dtype) propagate correctly.
         self.add_module("encoder", encoder)
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor, return_patches: bool = False) -> torch.Tensor:
-        z = self.encoder(x, training=False)  # [B, N, embed_dim]
+        z = self.encoder(x, training=self.training)  # [B, N, embed_dim]
         if return_patches:
             return z
         if self.pool == "mean":
