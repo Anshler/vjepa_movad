@@ -157,7 +157,13 @@ class VJEPA2Encoder(nn.Module):
         self.add_module("encoder", encoder)
 
     def forward(self, x: torch.Tensor, return_patches: bool = False) -> torch.Tensor:
-        z = self.encoder(x, training=self.training)  # [B, N, embed_dim]
+        # Always pass training=False — the V-JEPA ViT uses training=True to
+        # switch to hierarchical pretraining mode (concatenating intermediate
+        # layers → 4× embed_dim), which breaks all downstream code.
+        # training=False gives the standard single-layer output [B, N, embed_dim].
+        # Gradients still flow (no @torch.no_grad here); dropout stays off,
+        # which is the desired behavior for fine-tuning a pretrained ViT.
+        z = self.encoder(x, training=False)  # [B, N, embed_dim]
         if return_patches:
             return z
         if self.pool == "mean":
