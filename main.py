@@ -570,7 +570,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
 # Shared evaluation helper — one encode → evaluate all heads sequentially
 # Used by both train-time validation and standalone testing.
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+@torch.inference_mode()
 def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ctx=None):
     """Run validation/test inference and compute metrics for all heads.
 
@@ -739,7 +739,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
 # ---------------------------------------------------------------------------
 # Standalone testing — load checkpoints and evaluate
 # ---------------------------------------------------------------------------
-@torch.no_grad()
+@torch.inference_mode()
 def test(cfg, model, testdata_loader, epoch):
     head_names = list(model.heads.keys())
     autocast_ctx: dict[str, object] = {}

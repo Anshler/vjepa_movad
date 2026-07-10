@@ -14,7 +14,6 @@ All variants target ~15–25M trainable parameters with a frozen V-JEPA encoder.
 """
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 import math
 
@@ -991,41 +990,5 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
         train_encoder=cfg.get("train_encoder", False),
     ).to(cfg.device)
 
-    # Warm up the compiled encoder in eval mode with a representative
-    # validation-sized mega-batch so that torch.compile caches the eval graph
-    # BEFORE training starts.  Without this, the first validation call triggers
-    # compilation while training tensors are still in VRAM, spiking memory.
-    if cfg.get("compile", True) and hasattr(torch, "compile") and cfg.phase == "train":
-        _warmup_eval_compiled_graph(model, cfg)
-
     return model
 
-
-def _warmup_eval_compiled_graph(model: MultiHeadVJEPA, cfg) -> None:
-    """Prime the compiled encoder's eval-mode graph so validation doesn't
-    recompile while training tensors are live (which spikes VRAM).
-
-    ``torch.compile(…, dynamic=True)`` produces a shape-agnostic graph, so we
-    only need a tiny warmup to get the eval-mode cache entry populated.
-    The same graph then handles any validation batch size / video length."""
-    import gc as _gc
-
-    NF = cfg.get("num_frames", cfg.get("NF", 4))
-    img_size = cfg.get("img_size", 256)
-    # Small warmup is sufficient — dynamic=True handles any real size
-    t_warmup = cfg.get("VCL", 16)
-    b_warmup = 2
-
-    # Match the autocast dtype used by training & validation
-    amp_dtype_str = cfg.get("amp_dtype", "fp32")
-    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp_dtype_str)
-    autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext()
-
-    x = torch.randn(b_warmup, 3, t_warmup, img_size, img_size, device=cfg.device)
-    model.eval()
-    with torch.no_grad(), autocast_ctx:
-        _ = model.encode_video_clips(x, NF)
-    model.train(True)
-    del x
-    _gc.collect()
-    torch.cuda.empty_cache()
