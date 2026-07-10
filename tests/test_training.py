@@ -14,6 +14,7 @@ Usage (from WSL):
     python tests/test_training.py
     python tests/test_training.py --amp fp16
     python tests/test_training.py --checkpoint ~/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+    python tests/test_training.py --train_encoder --checkpoint ~/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
 """
 from __future__ import annotations
 
@@ -52,6 +53,8 @@ parser.add_argument("--amp", default="fp16", choices=list(_AMP_CHOICES),
                     help="AMP dtype (default: fp16)")
 parser.add_argument("--checkpoint", default=None,
                     help="Path to a pretrained V-JEPA checkpoint (.pt)")
+parser.add_argument("--train_encoder", action="store_true", default=False,
+                    help="Unfreeze the V-JEPA encoder and train jointly with the temporal head")
 args = parser.parse_args()
 AMP_DTYPE = _AMP_CHOICES[args.amp]
 CHECKPOINT_PATH = args.checkpoint  # None → don't load any weights
@@ -66,6 +69,7 @@ if CHECKPOINT_PATH:
 else:
     print("checkpoint: none (using random init)")
 print(f"amp: {args.amp}")
+print(f"train_encoder: {args.train_encoder}")
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +87,7 @@ def load_cfg(name: str) -> EasyDict:
 
 # Use a single-head config (closest to normal training)
 cfg = load_cfg("vjepa_mamba.yaml")
+cfg.train_encoder = args.train_encoder
 cfg._head_cfgs_flat = [dict(cfg)]
 cfg._head_cfgs_flat[0]["name"] = "mamba_test"
 
@@ -111,7 +116,11 @@ for name in list(model.heads.keys()):
     head_easy.device = DEVICE
     criterion[name] = build_loss(head_easy)
 
-    opt, _ = build_optimizer(EasyDict({"lr": cfg.lr}), model.heads[name], None)
+    # When training the encoder, pass the full model (encoder + head) to the optimizer
+    if args.train_encoder:
+        opt, _ = build_optimizer(EasyDict({"lr": cfg.lr}), model, None)
+    else:
+        opt, _ = build_optimizer(EasyDict({"lr": cfg.lr}), model.heads[name], None)
     optimizer[name] = opt
 
     _amp_cfg = head_cfgs[name].get("amp_dtype", "fp32")
@@ -121,10 +130,11 @@ for name in list(model.heads.keys()):
     )
 
 model.to(DEVICE)
-model.train()  # temporal heads in train mode, encoder stays eval
+model.train()  # temporal heads in train mode, encoder in train mode if unfrozen
 
 print(f"\nHead: {head_name}  temporal: {head.temporal_type}")
-print(f"Trainable params: {sum(p.numel() for p in head.parameters() if p.requires_grad):,}")
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Trainable params: {trainable:,} (encoder {'unfrozen' if args.train_encoder else 'frozen'})")
 
 # ---------------------------------------------------------------------------
 # Synthetic data — simulate 2 videos of 12 frames each (padded to v_len=12)
@@ -201,8 +211,9 @@ assert not torch.isnan(total_loss), "NaN in training loss!"
 # Backward + optimizer step
 optimizer[head_name].zero_grad()
 total_loss.backward()
+_grad_model = model if args.train_encoder else head
 grad_norm = sum(
-    p.grad.norm().item() for p in head.parameters() if p.grad is not None
+    p.grad.norm().item() for p in _grad_model.parameters() if p.grad is not None
 )
 optimizer[head_name].step()
 
@@ -303,6 +314,6 @@ print("  ✓ validation step OK")
 # Summary
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 70)
-print(f"All training + validation smoke tests passed!  (amp={AMP})")
+print(f"All training + validation smoke tests passed!  (amp={args.amp})")
 print("Autocast wrapping verified for:  encode_video_clips + forward_temporal_step")
 print("=" * 70)
