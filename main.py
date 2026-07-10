@@ -276,9 +276,14 @@ def _head_state_dict_without_encoder(head, train_encoder: bool = False):
     return {k: v for k, v in head.state_dict().items() if not k.startswith("encoder.")}
 
 
-def _load_head_state_dict(head, state_dict):
-    """Load state dict into a head, skipping encoder keys (frozen, loaded separately)."""
-    head.load_state_dict(state_dict, strict=False)
+def _load_head_state_dict(head, state_dict, strict=False):
+    """Load state dict into a head.
+
+    When ``strict=False`` (default), encoder keys are silently skipped (frozen
+    encoder loaded separately).  When ``strict=True`` (``--train_encoder``),
+    every key must match — the checkpoint should contain the full model.
+    """
+    head.load_state_dict(state_dict, strict=strict)
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +832,8 @@ if __name__ == "__main__":
                     "device": cfg.device,
                 })
                 ckpt = movad_utils.load_checkpoint(ckpt_cfg)
-                _load_head_state_dict(head, ckpt["model_state_dict"])
+                _load_head_state_dict(head, ckpt["model_state_dict"],
+                                      strict=cfg.train_encoder)
                 opt_state_dicts[name] = ckpt.get("optimizer_state_dict")
                 if wandb_resume_id is None:
                     wandb_resume_id = ckpt.get("wandb_run_id")
