@@ -1012,9 +1012,15 @@ def _warmup_eval_compiled_graph(model: MultiHeadVJEPA, cfg) -> None:
     t_warmup = 300  # > max DoTA val video (284 frames) so first (longest) batch is a cache hit
     b_warmup = 1
 
+    # Match the autocast dtype used by training & validation so the compiled
+    # graph keys match.  Without this the warmup runs in fp32 (2× memory).
+    amp_dtype_str = cfg.get("amp_dtype", "fp32")
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp_dtype_str)
+    autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext()
+
     x = torch.randn(b_warmup, 3, t_warmup, img_size, img_size, device=cfg.device)
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), autocast_ctx:
         _ = model.encode_video_clips(x, NF)
     model.train(True)
     del x
