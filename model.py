@@ -931,7 +931,14 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
     encoder = build_vjepa2_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="default")
+        # max-autotune-no-cudagraphs preserves operator fusion + kernel
+        # autotuning but avoids CUDA graphs, which pre-allocate every
+        # intermediate across the captured region.  With CUDA graphs, a
+        # 696-clip mega-batch through ViT-Base would need ~240 GB VRAM
+        # (12 layers × ~20 GB/layer of pre-allocated intermediates).
+        encoder.encoder = torch.compile(
+            encoder.encoder, mode="max-autotune-no-cudagraphs",
+        )
 
     model = ClsVJEPA(
         encoder=encoder,
@@ -971,7 +978,9 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
     encoder = build_vjepa2_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="default")
+        encoder.encoder = torch.compile(
+            encoder.encoder, mode="max-autotune-no-cudagraphs",
+        )
 
     head_configs = []
     for hc in cfg._head_cfgs_flat:

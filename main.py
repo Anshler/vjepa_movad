@@ -455,7 +455,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
                 next_info = next_info.to(cfg.device, non_blocking=True)
 
             # Encoder runs ONCE for all heads
-            patches = model.encode_video_clips(video_data, cfg.NF)
+            with autocast_ctx[head_names[0]]:
+                patches = model.encode_video_clips(video_data, cfg.NF)
 
             # Train each head sequentially — independent forward + backward
             postfix_parts = []
@@ -536,7 +537,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
             torch.cuda.empty_cache()
 
             print(f"\n  === Validation at epoch {e+1} ===")
-            _evaluate_model(cfg, model, testdata_loader, e + 1, writer=shared_writer)
+            _evaluate_model(cfg, model, testdata_loader, e + 1, writer=shared_writer, autocast_ctx=autocast_ctx)
 
             # After eval: reclaim eval tensors, then recreate training iterator
             # for the next epoch.
@@ -570,7 +571,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
 # Used by both train-time validation and standalone testing.
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
+def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ctx=None):
     """Run validation/test inference and compute metrics for all heads.
 
     Parameters
@@ -619,7 +620,9 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
             video_data = torch.swapaxes(video_data, 1, 2)
             B = video_data.shape[0]
             v_len_max = video_data.shape[2]         # already padded to max in bucket
-            patches = model.encode_video_clips(video_data, fb)
+            _ac = autocast_ctx.get(head_names[0], nullcontext()) if autocast_ctx else nullcontext()
+            with _ac:
+                patches = model.encode_video_clips(video_data, fb)
 
         video_len_orig = data_info[:, 0]            # [B] — truth for masking
         idx_batch = data_info[:, 1]
@@ -640,7 +643,9 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
             for i in range(fb, v_len_max):
                 target = gt_cls_target(i, toa_batch, tea_batch).long()
                 feat = patches_in[:, i - fb, ...].float()   # fp16→fp32 for LayerNorm
-                output, state = head.forward_temporal_step(feat, state)
+                _ac = autocast_ctx.get(name, nullcontext()) if autocast_ctx else nullcontext()
+                with _ac:
+                    output, state = head.forward_temporal_step(feat, state)
 
                 # Mask padded positions — identical pattern to training loop
                 flt = i >= video_len_orig
@@ -736,7 +741,14 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def test(cfg, model, testdata_loader, epoch):
-    return _evaluate_model(cfg, model, testdata_loader, epoch, writer=None)
+    head_names = list(model.heads.keys())
+    autocast_ctx: dict[str, object] = {}
+    for name in head_names:
+        hc = model.head_configs.get(name, {})
+        _amp_cfg = hc.get("amp_dtype", cfg.get("amp_dtype", "fp32"))
+        _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
+        autocast_ctx[name] = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
+    return _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ctx=autocast_ctx)
 
 
 # ---------------------------------------------------------------------------
