@@ -544,7 +544,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
             torch.cuda.empty_cache()
             gc.collect()
             model.train(True)
-            # Training iterator is recreated at the top of the next epoch (line 419)
+            # Training iterator is recreated at the top of the next epoch
 
     shared_writer.finish()
 
