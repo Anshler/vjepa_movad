@@ -14,6 +14,7 @@ All variants target ~15–25M trainable parameters with a frozen V-JEPA encoder.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import math
 
@@ -978,7 +979,7 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
     encoder = build_vjepa2_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="default")
+        encoder.encoder = torch.compile(encoder.encoder, mode="default", dynamic=True)
 
     head_configs = []
     for hc in cfg._head_cfgs_flat:
@@ -1001,19 +1002,21 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
 
 
 def _warmup_eval_compiled_graph(model: MultiHeadVJEPA, cfg) -> None:
-    """Run a single eval-mode ``encode_video_clips`` with a realistic clip count
-    so that torch.compile caches its eval graph.  Without this, the first
-    validation call triggers a recompile while training tensors are still live,
-    which can spike VRAM dramatically (96 GB+)."""
+    """Prime the compiled encoder's eval-mode graph so validation doesn't
+    recompile while training tensors are live (which spikes VRAM).
+
+    ``torch.compile(…, dynamic=True)`` produces a shape-agnostic graph, so we
+    only need a tiny warmup to get the eval-mode cache entry populated.
+    The same graph then handles any validation batch size / video length."""
     import gc as _gc
 
     NF = cfg.get("num_frames", cfg.get("NF", 4))
     img_size = cfg.get("img_size", 256)
-    t_warmup = 300  # > max DoTA val video (284 frames) so first (longest) batch is a cache hit
-    b_warmup = 1
+    # Small warmup is sufficient — dynamic=True handles any real size
+    t_warmup = cfg.get("VCL", 16)
+    b_warmup = 2
 
-    # Match the autocast dtype used by training & validation so the compiled
-    # graph keys match.  Without this the warmup runs in fp32 (2× memory).
+    # Match the autocast dtype used by training & validation
     amp_dtype_str = cfg.get("amp_dtype", "fp32")
     amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp_dtype_str)
     autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype else nullcontext()
