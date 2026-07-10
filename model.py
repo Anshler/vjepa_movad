@@ -978,9 +978,7 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
     encoder = build_vjepa2_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(
-            encoder.encoder, mode="max-autotune-no-cudagraphs",
-        )
+        encoder.encoder = torch.compile(encoder.encoder, mode="default")
 
     head_configs = []
     for hc in cfg._head_cfgs_flat:
@@ -991,4 +989,34 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
         encoder=encoder, heads_configs=head_configs,
         train_encoder=cfg.get("train_encoder", False),
     ).to(cfg.device)
+
+    # Warm up the compiled encoder in eval mode with a representative
+    # validation-sized mega-batch so that torch.compile caches the eval graph
+    # BEFORE training starts.  Without this, the first validation call triggers
+    # compilation while training tensors are still in VRAM, spiking memory.
+    if cfg.get("compile", True) and hasattr(torch, "compile") and cfg.phase == "train":
+        _warmup_eval_compiled_graph(model, cfg)
+
     return model
+
+
+def _warmup_eval_compiled_graph(model: MultiHeadVJEPA, cfg) -> None:
+    """Run a single eval-mode ``encode_video_clips`` with a realistic clip count
+    so that torch.compile caches its eval graph.  Without this, the first
+    validation call triggers a recompile while training tensors are still live,
+    which can spike VRAM dramatically (96 GB+)."""
+    import gc as _gc
+
+    NF = cfg.get("num_frames", cfg.get("NF", 4))
+    img_size = cfg.get("img_size", 256)
+    t_warmup = 300  # > max DoTA val video (284 frames) so first (longest) batch is a cache hit
+    b_warmup = 1
+
+    x = torch.randn(b_warmup, 3, t_warmup, img_size, img_size, device=cfg.device)
+    model.eval()
+    with torch.no_grad():
+        _ = model.encode_video_clips(x, NF)
+    model.train(True)
+    del x
+    _gc.collect()
+    torch.cuda.empty_cache()
