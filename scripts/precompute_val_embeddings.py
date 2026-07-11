@@ -119,11 +119,7 @@ def main():
         with torch.no_grad():
             patches = model.encode_video_clips(video_data, fb)
 
-        # Expected dimensions
-        enc = model.encoder.encoder
-        expected_N = (cfg.num_frames // enc.tubelet_size) \
-                     * (cfg.img_size // enc.patch_size) \
-                     * (cfg.img_size // enc.patch_size)
+        # Expected dimensions (encoder-agnostic — derived from actual output)
         expected_D = model.encoder.embed_dim
         expected_clips = v_len - cfg.num_frames
 
@@ -131,7 +127,7 @@ def main():
         print(f"  Video frames (T):       {v_len}")
         print(f"  num_frames (fb):        {cfg.num_frames}")
         print(f"  Expected n_clips:       {expected_clips}")
-        print(f"  Expected N_patches:     {expected_N}")
+        print(f"  Actual N_patches:       {patches.shape[2]}")
         print(f"  Expected embed_dim:     {expected_D}")
         print(f"  patches_full.shape:     {list(patches.shape)}")
         print(f"  data_info.shape:        {list(data_info.shape)}")
@@ -141,8 +137,6 @@ def main():
         assert patches.shape[0] == 1, f"batch dim should be 1, got {patches.shape[0]}"
         assert patches.shape[1] == expected_clips, \
             f"n_clips mismatch: got {patches.shape[1]}, expected {expected_clips}"
-        assert patches.shape[2] == expected_N, \
-            f"N_patches mismatch: got {patches.shape[2]}, expected {expected_N}"
         assert patches.shape[3] == expected_D, \
             f"embed_dim mismatch: got {patches.shape[3]}, expected {expected_D}"
         assert data_info.shape == (1, 11), \
@@ -161,12 +155,13 @@ def main():
 
         print(f"\n  Saved & reloaded from: {verify_path}")
         print(f"  loaded[patches_full].shape: {list(loaded['patches_full'].shape)}")
+        stored_N = patches.shape[2]  # actual N from the saved data
         print(f"  loaded[patches_full].dtype: {loaded['patches_full'].dtype}")
         print(f"  loaded[data_info].shape:    {list(loaded['data_info'].shape)}")
         print(f"  loaded[data_info].dtype:    {loaded['data_info'].dtype}")
         print(f"  loaded[v_len]:              {loaded['v_len']}")
 
-        assert list(loaded["patches_full"].shape) == [expected_clips, expected_N, expected_D], \
+        assert list(loaded["patches_full"].shape) == [expected_clips, stored_N, expected_D], \
             f"Loaded shape mismatch: {list(loaded['patches_full'].shape)}"
         assert loaded["patches_full"].dtype == torch.float16, "Saved patches should be float16"
         assert list(loaded["data_info"].shape) == [11]

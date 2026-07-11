@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vjepa_encoder import VJEPA2Encoder, build_vjepa2_encoder
+from swin_encoder import SwinEncoder, build_swin_encoder
 
 # ---------------------------------------------------------------------------
 # Mamba_ssm import
@@ -213,10 +214,31 @@ class NoTemporalModel(nn.Module):
 # Temporal model: LSTM
 # ===========================================================================
 class LSTMTemporalModel(nn.Module):
-    def __init__(self, dim: int, hidden_size: int, num_layers: int = 3):
+    """Multi-layer LSTM — matches MOVAD's ``nn.LSTM(dim, hidden, num_layers)``.
+
+    MOVAD uses unidirectional LSTM (default).  Set ``bidirectional=True`` if
+    you want bidirectional (output dim becomes ``2 * hidden_size``, and
+    ``ClsVJEPA.lin2`` is resized accordingly).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_size: int,
+        num_layers: int = 3,
+        bidirectional: bool = False,
+    ):
         super().__init__()
-        self.rnn = nn.LSTM(dim, hidden_size, num_layers)
+        self.rnn = nn.LSTM(
+            dim, hidden_size, num_layers, bidirectional=bidirectional
+        )
         self.norm = nn.LayerNorm(dim)
+        self.hidden_size = hidden_size
+        self.bidirectional = bidirectional
+
+    @property
+    def output_dim(self) -> int:
+        return self.hidden_size * (2 if self.bidirectional else 1)
 
     def forward(self, x, state=None):
         x = self.norm(x).unsqueeze(0)
@@ -654,7 +676,6 @@ class ClsVJEPA(nn.Module):
         verbose: bool = True,
     ):
         super().__init__()
-        self.encoder = encoder
         self.temporal_type = temporal_model
         self.train_encoder = train_encoder
 
@@ -690,6 +711,7 @@ class ClsVJEPA(nn.Module):
                 nn.Linear(dim_latent, 2),
             )
             self.apply(_weights_init)
+            self.encoder = encoder   # attach AFTER weight init — preserves pretrained weights
 
             mode = "sparse" if is_sparse else "dense"
             if verbose:
@@ -699,14 +721,23 @@ class ClsVJEPA(nn.Module):
 
         # ---- Standard path --------------------------------------------------
         self._slot_based = False
-        self.lin1 = nn.Linear(embed_dim, dim_latent)
+        self._is_swin = isinstance(encoder, SwinEncoder)
+
+        # MOVAD architecture for Swin: AdaptiveAvgPool3d((1,6,6)) → 36 grid cells.
+        # The projection LN(36*C) → Linear(36*C→dim_latent) matches MOVAD's
+        # shape_input=36864 → dim_latent=1024 mapping exactly.
+        in_features = embed_dim * encoder.num_patches if self._is_swin else embed_dim
+
+        self.bn = nn.LayerNorm(in_features)
+        self.lin1 = nn.Linear(in_features, dim_latent)
         self.lin2 = nn.Linear(dim_latent, dim_latent)
         self.lin3 = nn.Linear(dim_latent, 2)
-        self.bn = nn.LayerNorm(embed_dim)
         self.drop = nn.Dropout(dropout)
 
         if temporal_model == "lstm":
             self.temporal = LSTMTemporalModel(dim_latent, rnn_state_size, rnn_cell_num)
+            temporal_out = self.temporal.output_dim   # 2 * rnn_state_size when bidirectional
+            self.lin2 = nn.Linear(temporal_out, dim_latent)   # override: bidirectional → 2× hidden
         elif temporal_model == "mamba":
             _require_mamba()
             self.temporal = MambaTemporalModel(
@@ -720,6 +751,7 @@ class ClsVJEPA(nn.Module):
             raise ValueError(f"Unknown temporal_model: {temporal_model}")
 
         self.apply(_weights_init)
+        self.encoder = encoder   # attach AFTER weight init — preserves pretrained weights
 
         if verbose:
             print("\n[ClsVJEPA] Parameter summary:")
@@ -729,7 +761,7 @@ class ClsVJEPA(nn.Module):
             )
 
     def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
-        """Run the frozen ViT over every NF-frame sliding window in one batch of videos.
+        """Run the encoder over every NF-frame sliding window in one batch of videos.
 
         Stacks all stride-1 clips into a mega-batch and encodes in a single
         ``no_grad`` pass.  Memory scales with ``batch_size × VCL`` — keep VCL
@@ -745,17 +777,25 @@ class ClsVJEPA(nn.Module):
             clips.append(x[:, :, i - num_frames:i, :, :])              # [B, C, NF, H, W]  (view)
         mega_batch = torch.cat(clips, dim=0)                            # [B * n_clips, C, NF, H, W]
 
-        # N_patches = T_tokens × H_patches × W_patches  (deterministic from config)
-        enc = self.encoder.encoder
-        N_patches = (num_frames // enc.tubelet_size) * (H // enc.patch_size) * (W // enc.patch_size)
-
         # When training the encoder, let gradients flow; otherwise freeze
         ctx = torch.no_grad() if not self.train_encoder else torch.enable_grad()
         with ctx:
             patches = self.encoder(mega_batch, return_patches=True)     # [B * n_clips, N_patches, embed_dim]
 
+        N_patches = patches.shape[1]                                     # encoder-agnostic
         patches = patches.view(B, n_clips, N_patches, -1)               # [B, n_clips, N_patches, embed_dim]
         return patches
+
+    @property
+    def _needs_patches(self) -> bool:
+        """Whether ``forward_temporal_step`` expects full patch/grid tokens.
+
+        Slot-based heads need ``[B, N_patches, embed_dim]`` for
+        cross-attention.  Swin standard heads need ``[B, 36, embed_dim]``
+        for the MOVAD AdaptiveAvgPool3d projection.  ViT standard heads use
+        ``[B, embed_dim]`` (mean-pooled) and return False here.
+        """
+        return self._slot_based or self._is_swin
 
     def forward_temporal_step(
         self, x: torch.Tensor, state: torch.Tensor | tuple | None = None,
@@ -763,7 +803,8 @@ class ClsVJEPA(nn.Module):
         """Single temporal step from pre-computed encoder output.
 
         Args:
-            x:     For standard path: ``[B, embed_dim]`` (spatially mean-pooled).
+            x:     For standard ViT path: ``[B, embed_dim]`` (spatially mean-pooled).
+                   For Swin standard path: ``[B, 36, embed_dim]`` (grid cells).
                    For slot path: ``[B, N_patches, embed_dim]`` (full patch tokens).
             state: temporal-model state (MambaCache or LSTM tuple).
 
@@ -780,6 +821,8 @@ class ClsVJEPA(nn.Module):
             return self.classifier(pooled), new_state
 
         # Standard path: bn → lin1 → relu → temporal → lin2 → relu → lin3
+        if self._is_swin:
+            x = x.flatten(1)    # [B, 36, C] → [B, 36*C]  (MOVAD projection)
         x = self.bn(x)
         x = F.relu(self.lin1(x))
         x = self.drop(x)
@@ -800,7 +843,11 @@ class ClsVJEPA(nn.Module):
             pooled = (attn.unsqueeze(-1) * slots).sum(dim=1)   # [B, D]
             return self.classifier(pooled), new_state
 
-        x = self.encoder(x)                                   # [B, embed_dim]
+        if self._is_swin:
+            x = self.encoder(x, return_patches=True)           # [B, 36, embed_dim]
+            x = x.flatten(1)                                   # [B, 36*C]
+        else:
+            x = self.encoder(x)                                # [B, embed_dim]
         x = self.bn(x)
         x = F.relu(self.lin1(x))
         x = self.drop(x)
@@ -836,7 +883,7 @@ class MultiHeadVJEPA(nn.Module):
     >>> for name, head in model.heads.items():
     >>>     opt = optimizers[name]
     >>>     opt.zero_grad()
-    >>>     feat = patches if head._slot_based else patches.mean(dim=2)
+    >>>     feat = patches if head._needs_patches else patches.mean(dim=2)
     >>>     loss = run_temporal_loop(head, feat, ...)
     >>>     loss.backward()
     >>>     opt.step()
@@ -917,9 +964,9 @@ class MultiHeadVJEPA(nn.Module):
         (all heads share the same encoder, so the output is identical).
         Gradients flow through the encoder when ``train_encoder=True``.
 
-        Returns ``[B, n_clips, N_patches, embed_dim]`` — raw patch tokens.
-        Standard-path heads call ``.mean(dim=2)`` on this; slot-based heads
-        use the full tensor.
+        Returns ``[B, n_clips, N_patches, embed_dim]`` — raw patch/grid tokens.
+        Standard ViT heads call ``.mean(dim=2)`` on this; slot-based and
+        Swin standard heads use the full tensor (checked via ``head._needs_patches``).
         """
         return next(iter(self.heads.values())).encode_video_clips(x, num_frames)
 
@@ -927,11 +974,25 @@ class MultiHeadVJEPA(nn.Module):
 # ===========================================================================
 # Factories
 # ===========================================================================
+def _build_encoder(cfg):
+    """Build the spatial encoder (V-JEPA ViT or Swin 3D) based on ``model_name``."""
+    model_name = cfg.get("model_name", "vit_base")
+    if model_name.startswith("swin"):
+        return build_swin_encoder(cfg)
+    return build_vjepa2_encoder(cfg)
+
+
 def build_cls_vjepa(cfg) -> ClsVJEPA:
-    encoder = build_vjepa2_encoder(cfg)
+    encoder = _build_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="default")
+        backbone = getattr(encoder, "encoder", None) or getattr(encoder, "swin", None)
+        if backbone is not None:
+            compiled = torch.compile(backbone, mode="default")
+            if hasattr(encoder, "encoder"):
+                encoder.encoder = compiled
+            else:
+                encoder.swin = compiled
 
     model = ClsVJEPA(
         encoder=encoder,
@@ -968,10 +1029,16 @@ def build_multi_head_vjepa(cfg) -> MultiHeadVJEPA:
     Every head inherits shared defaults from the master config (``dim_latent``,
     ``dropout``, etc.) but can override them per-head.
     """
-    encoder = build_vjepa2_encoder(cfg)
+    encoder = _build_encoder(cfg)
 
     if cfg.get("compile", True) and hasattr(torch, "compile"):
-        encoder.encoder = torch.compile(encoder.encoder, mode="default")
+        backbone = getattr(encoder, "encoder", None) or getattr(encoder, "swin", None)
+        if backbone is not None:
+            compiled = torch.compile(backbone, mode="default")
+            if hasattr(encoder, "encoder"):
+                encoder.encoder = compiled
+            else:
+                encoder.swin = compiled
 
     head_configs = []
     for hc in cfg._head_cfgs_flat:

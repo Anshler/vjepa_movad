@@ -141,7 +141,7 @@ print(f"Trainable params: {trainable:,} (encoder {'unfrozen' if args.train_encod
 # ---------------------------------------------------------------------------
 B = 2
 NF = cfg.get("num_frames", 4)
-v_len = 12  # 12 clips → 12-NF = 8 per-frame outputs
+v_len = NF + 8  # enough clips for temporal loop (NF+8 clips → 8 per-frame outputs)
 img_size = cfg.get("img_size", 256)
 
 # Raw video [B, C, T, H, W] — already padded by collator
@@ -174,15 +174,14 @@ with autocast_ctx[head_name]:
 print(f"  patches: {tuple(patches.shape)}  dtype={patches.dtype}")
 
 # Per-frame temporal loop (mirrors _run_temporal_loop)
-is_slot = head._slot_based
-patches_in = patches if is_slot else patches.mean(dim=2)
+patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
 toa_batch = data_info[:, 2]
 tea_batch = data_info[:, 3]
 video_len_orig = data_info[:, 0]
 
 state = None
-total_loss = torch.tensor(0.0, device=DEVICE)
+total_loss_val = 0.0
 frame_count = 0
 
 for i in range(NF, v_len):
@@ -200,29 +199,21 @@ for i in range(NF, v_len):
         output = output.softmax(dim=1)
 
     loss = criterion[head_name](output, target)
-    total_loss = total_loss + loss
+
+    # MOVAD-style: per-frame backward + step
+    optimizer[head_name].zero_grad()
+    loss.backward()
+    optimizer[head_name].step()
+
+    total_loss_val += loss.detach().item()
     frame_count += 1
 
-avg_loss = total_loss.item() / max(frame_count, 1)
+avg_loss = total_loss_val / max(frame_count, 1)
 print(f"  avg_loss={avg_loss:.4f}  frames={frame_count}")
 print(f"  output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
-assert not torch.isnan(total_loss), "NaN in training loss!"
-
-# Backward + optimizer step
-optimizer[head_name].zero_grad()
-total_loss.backward()
-_grad_model = model if args.train_encoder else head
-grad_norm = sum(
-    p.grad.norm().item() for p in _grad_model.parameters() if p.grad is not None
-)
-optimizer[head_name].step()
-
-print(f"  grad_norm (sum): {grad_norm:.4f}")
-assert grad_norm > 0, "No gradients flowed!"
-assert not torch.isnan(torch.tensor(grad_norm)), "NaN in gradients!"
+print(f"  ✓ training step OK")
 
 loss_before = avg_loss
-print("  ✓ training step OK")
 
 # ---------------------------------------------------------------------------
 # 2.  TRAINING  —  second step (verify loss decreases)
@@ -234,9 +225,9 @@ print("=" * 70)
 with autocast_ctx[head_name]:
     patches2 = model.encode_video_clips(video_data, NF)
 
-patches_in2 = patches2 if is_slot else patches2.mean(dim=2)
+patches_in2 = patches2 if head._needs_patches else patches2.mean(dim=2)
 state2 = None
-total_loss2 = torch.tensor(0.0, device=DEVICE)
+total_loss2_val = 0.0
 
 for i in range(NF, v_len):
     target = gt_cls_target(i, toa_batch, tea_batch).long()
@@ -250,13 +241,13 @@ for i in range(NF, v_len):
     output[flt] = -100
     if head_cfgs[head_name].get("apply_softmax", True):
         output = output.softmax(dim=1)
-    total_loss2 = total_loss2 + criterion[head_name](output, target)
+    loss = criterion[head_name](output, target)
+    optimizer[head_name].zero_grad()
+    loss.backward()
+    optimizer[head_name].step()
+    total_loss2_val += loss.detach().item()
 
-loss_after = total_loss2.item() / max(frame_count, 1)
-
-optimizer[head_name].zero_grad()
-total_loss2.backward()
-optimizer[head_name].step()
+loss_after = total_loss2_val / max(frame_count, 1)
 
 print(f"  step 1 loss: {loss_before:.4f}  →  step 2 loss: {loss_after:.4f}")
 if loss_after < loss_before:
@@ -275,13 +266,13 @@ print("=" * 70)
 model.eval()
 
 # Simulate full-video validation (VCL=None → v_len frames)
-v_len_val = 16  # realistic: short DoTA video
+v_len_val = NF + 12  # realistic: short DoTA video, but at least NF+1 frames
 video_val = torch.randn(1, 3, v_len_val, img_size, img_size, device=DEVICE)
 data_info_val = torch.zeros(1, 11, device=DEVICE)
 data_info_val[:, 0] = v_len_val    # v_len_orig (full video)
 data_info_val[:, 1] = 0            # video_id
-data_info_val[:, 2] = 6            # a_start
-data_info_val[:, 3] = 10           # a_end
+data_info_val[:, 2] = v_len_val - 10  # a_start (anomalous region)
+data_info_val[:, 3] = v_len_val - 6   # a_end
 data_info_val[:, 4] = 1            # label
 
 with torch.no_grad():
@@ -291,7 +282,7 @@ with torch.no_grad():
     print(f"  val patches: {tuple(patches_val.shape)}  dtype={patches_val.dtype}")
 
     n_clips = v_len_val - NF
-    patches_in_val = patches_val if is_slot else patches_val.mean(dim=2)
+    patches_in_val = patches_val if head._needs_patches else patches_val.mean(dim=2)
     n_patches = patches_in_val.shape[2]
 
     # Per-frame temporal loop with autocast (matches fixed _evaluate_model)

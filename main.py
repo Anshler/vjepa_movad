@@ -188,7 +188,8 @@ def parse_configs():
                         help="Disable validation during training")
     parser.add_argument("--validation_epoch_step", type=int, default=None,
                         help="Validate every N epochs (overrides config)")
-    parser.add_argument("--VCL", type=int, default=None, help="Variational continual learning clip count (overrides config)")
+    parser.add_argument("--num_frames", type=int, default=None, help="Frames per encoder clip / NF (overrides config)")
+    parser.add_argument("--VCL", type=int, default=None, help="Video clip length in frames (overrides config)")
     parser.add_argument("--checkpoint_path", default=None, help="Pretrained encoder checkpoint (overrides config)")
     parser.add_argument("--data_path", default=None, help="Dataset root directory (overrides config)")
     parser.add_argument("--output", default=None, help="Output directory (default: from first config)")
@@ -214,6 +215,7 @@ def parse_configs():
     _yaml_ckpt = cfg.get("checkpoint_path", None)
     _yaml_data = cfg.get("data_path", "./data/dota")
     _yaml_vcl = cfg.get("VCL", 16)
+    _yaml_nf = cfg.get("num_frames", 16)
     _yaml_batch = cfg.get("batch_size", 8)
     _yaml_lr = cfg.get("lr", 0.0001)
 
@@ -239,6 +241,8 @@ def parse_configs():
         cfg.batch_size = _yaml_batch
     if args.lr is None:
         cfg.lr = _yaml_lr
+    if args.num_frames is None:
+        cfg.num_frames = _yaml_nf
 
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -315,7 +319,6 @@ def train(cfg, model, traindata_loader, begin_epoch,
     criterion: dict[str, torch.nn.Module] = {}
     optimizer: dict[str, torch.optim.Optimizer] = {}
     output_dirs: dict[str, str] = {}
-    accum_steps: dict[str, int] = {}
     autocast_ctx: dict[str, object] = {}
 
     for name in head_names:
@@ -355,7 +358,6 @@ def train(cfg, model, traindata_loader, begin_epoch,
         _amp_cfg = head_cfgs[name].get("amp_dtype", "fp32")
         _amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
         autocast_ctx[name] = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
-        accum_steps[name] = head_cfgs[name].get("grad_accum", 1)
 
     # -------------------------------------------------------------------
     # Shared wandb writer — ONE run for all heads with metric names
@@ -377,7 +379,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
     # parameterised by head name so slot diagnostics route to the right
     # wandb writer.
     # -------------------------------------------------------------------
-    def _run_temporal_loop(head, patches_clips, data_info, fb, v_len, head_name):
+    def _run_temporal_loop(head, patches_clips, data_info, fb, v_len, head_name, opt):
+        """MOVAD-style per-frame training: backward + step at every frame."""
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         video_len_orig = data_info[:, 0]
@@ -388,7 +391,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
 
         state = None
         slot_diag = {}
-        total_loss = torch.tensor(0.0, device=data_info.device)
+        total_loss_val = 0.0
         frame_count = 0
 
         for i in range(fb, v_len):
@@ -421,22 +424,24 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     slot_diag["usage_frac"] = min(slot_diag.get("usage_frac", 999.0), float(head.temporal._slot_usage_frac))
                     slot_diag["_count"] = slot_diag.get("_count", 0) + 1
 
-            total_loss = total_loss + loss
+            # MOVAD-style: per-frame backward + step
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss_val += loss.detach().item()
             frame_count += 1
             targets[:, i - fb] = target.clone()
             out = output.max(1)[1]
             out[target == -100] = -100
             outputs_t[:, i - fb] = out
 
-        return total_loss, frame_count, slot_diag, targets, outputs_t
+        return total_loss_val, frame_count, slot_diag, targets, outputs_t
 
     # -------------------------------------------------------------------
     # Epoch loop
     # -------------------------------------------------------------------
     model.train(True)
-    accum_losses: dict[str, torch.Tensor] = {}
-    for name in head_names:
-        accum_losses[name] = torch.tensor(0.0, device=cfg.device)
 
     for e in range(begin_epoch, cfg.epochs):
         epoch_losses = {n: 0.0 for n in head_names}
@@ -467,27 +472,17 @@ def train(cfg, model, traindata_loader, begin_epoch,
             postfix_parts = []
             for name in head_names:
                 head = model.heads[name]
-                is_slot = head._slot_based
 
-                patches_in = patches if is_slot else patches.mean(dim=2)
+                patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
                 total_loss, f_count, slot_diag, _, _ = _run_temporal_loop(
-                    head, patches_in, data_info, cfg.NF, v_len, name,
+                    head, patches_in, data_info, cfg.NF, v_len, name, optimizer[name],
                 )
 
-                epoch_losses[name] += total_loss.item()
+                epoch_losses[name] += total_loss
                 epoch_frames[name] += max(f_count, 1)
 
-                accum_losses[name] = accum_losses[name] + (total_loss / accum_steps[name])
-
-                step_now = ((j + 1) % accum_steps[name] == 0) or (j == n_batches - 1)
-                if step_now:
-                    optimizer[name].zero_grad()
-                    accum_losses[name].backward()
-                    optimizer[name].step()
-                    accum_losses[name] = torch.tensor(0.0, device=cfg.device)
-
-                avg_loss = total_loss.item() / max(f_count, 1)
+                avg_loss = total_loss / max(f_count, 1)
                 shared_writer.log({f"{name}/train/loss_step": avg_loss},
                                   step=e * 1000 + int(j * 1000 / n_batches))
                 postfix_parts.append(f"{name}:{avg_loss:.3f}")
@@ -637,8 +632,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
 
         for name in head_names:
             head = model.heads[name]
-            is_slot = head._slot_based
-            patches_in = patches if is_slot else patches.mean(dim=2)
+            patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
             t_shape = (B, v_len_max - fb)
             targets = torch.full(t_shape, -100).to(cfg.device)
@@ -763,8 +757,12 @@ if __name__ == "__main__":
     cfg = parse_configs()
     set_deterministic(cfg.seed)
 
-    # Derive NF from num_frames so they can't drift apart
+    # Derive NF from num_frames so they can't drift apart.
     if "NF" not in cfg:
+        cfg.NF = cfg.num_frames
+    # If the user overrode num_frames via CLI, keep NF in sync
+    if cfg.num_frames != cfg.NF:
+        print(f"  NF synced: {cfg.NF} → {cfg.num_frames} (from --num_frames)")
         cfg.NF = cfg.num_frames
 
     # --- Data --------------------------------------------------------------
