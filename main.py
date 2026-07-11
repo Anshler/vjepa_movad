@@ -379,8 +379,19 @@ def train(cfg, model, traindata_loader, begin_epoch,
     # parameterised by head name so slot diagnostics route to the right
     # wandb writer.
     # -------------------------------------------------------------------
-    def _run_temporal_loop(head, patches_clips, data_info, fb, v_len, head_name, opt):
-        """MOVAD-style per-frame training: backward + step at every frame."""
+    def _run_temporal_loop(head, patches_or_video, data_info, fb, v_len, head_name, opt,
+                           train_encoder=False):
+        """MOVAD-style per-frame training: backward + step at every frame.
+
+        When ``train_encoder=True``, ``patches_or_video`` is raw video
+        ``[B, C, T, H, W]`` and each frame's clip is encoded individually,
+        giving each temporal step its own independent computation graph
+        (so repeated ``.backward()`` calls don't conflict).
+
+        When ``train_encoder=False``, ``patches_or_video`` is pre-computed
+        encoder output ``[B, n_clips, ...]`` (mega-batch optimisation — safe
+        because the frozen encoder produces no gradient graph).
+        """
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         video_len_orig = data_info[:, 0]
@@ -398,7 +409,15 @@ def train(cfg, model, traindata_loader, begin_epoch,
             target = gt_cls_target(i, toa_batch, tea_batch).long()
 
             with autocast_ctx[head_name]:
-                feat = patches_clips[:, i - fb, ...]
+                if train_encoder:
+                    # Encode this single clip — independent graph per frame
+                    clip = patches_or_video[:, :, i - fb:i, :, :]
+                    feat = head.encoder(clip, return_patches=True)
+                    if not head._needs_patches:
+                        feat = feat.mean(dim=1)
+                else:
+                    feat = patches_or_video[:, i - fb, ...]
+
                 output, state = head.forward_temporal_step(feat, state)
 
             flt = i >= video_len_orig
@@ -464,19 +483,25 @@ def train(cfg, model, traindata_loader, begin_epoch,
                 next_video = next_video.to(cfg.device, non_blocking=True)
                 next_info = next_info.to(cfg.device, non_blocking=True)
 
-            # Encoder runs ONCE for all heads
-            with autocast_ctx[head_names[0]]:
-                patches = model.encode_video_clips(video_data, cfg.NF)
+            # Encoder: mega-batch when frozen, per-frame when training
+            train_enc = cfg.get("train_encoder", False)
+            if not train_enc:
+                with autocast_ctx[head_names[0]]:
+                    patches = model.encode_video_clips(video_data, cfg.NF)
 
             # Train each head sequentially — independent forward + backward
             postfix_parts = []
             for name in head_names:
                 head = model.heads[name]
 
-                patches_in = patches if head._needs_patches else patches.mean(dim=2)
+                if train_enc:
+                    patches_in = video_data  # raw — encoded per-frame in the loop
+                else:
+                    patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
                 total_loss, f_count, slot_diag, _, _ = _run_temporal_loop(
                     head, patches_in, data_info, cfg.NF, v_len, name, optimizer[name],
+                    train_encoder=train_enc,
                 )
 
                 epoch_losses[name] += total_loss

@@ -168,13 +168,13 @@ print("\n" + "=" * 70)
 print("1. TRAINING — one step")
 print("=" * 70)
 
-# Encode with autocast (matching the main.py fix)
-with autocast_ctx[head_name]:
-    patches = model.encode_video_clips(video_data, NF)
-print(f"  patches: {tuple(patches.shape)}  dtype={patches.dtype}")
-
-# Per-frame temporal loop (mirrors _run_temporal_loop)
-patches_in = patches if head._needs_patches else patches.mean(dim=2)
+# Mega-batch encode (frozen encoder) or per-frame (training encoder)
+train_enc = args.train_encoder
+if not train_enc:
+    with autocast_ctx[head_name]:
+        patches = model.encode_video_clips(video_data, NF)
+    print(f"  patches: {tuple(patches.shape)}  dtype={patches.dtype}")
+    patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
 toa_batch = data_info[:, 2]
 tea_batch = data_info[:, 3]
@@ -188,7 +188,15 @@ for i in range(NF, v_len):
     target = gt_cls_target(i, toa_batch, tea_batch).long()
 
     with autocast_ctx[head_name]:
-        feat = patches_in[:, i - NF, ...]
+        if train_enc:
+            # Encode each clip individually — independent graph per frame
+            clip = video_data[:, :, i - NF:i, :, :]
+            feat = head.encoder(clip, return_patches=True)
+            if not head._needs_patches:
+                feat = feat.mean(dim=1)
+        else:
+            feat = patches_in[:, i - NF, ...]
+
         output, state = head.forward_temporal_step(feat, state)
 
     flt = i >= video_len_orig
@@ -222,10 +230,11 @@ print("\n" + "=" * 70)
 print("2. TRAINING — second step (check loss decreases)")
 print("=" * 70)
 
-with autocast_ctx[head_name]:
-    patches2 = model.encode_video_clips(video_data, NF)
+if not train_enc:
+    with autocast_ctx[head_name]:
+        patches2 = model.encode_video_clips(video_data, NF)
+    patches_in2 = patches2 if head._needs_patches else patches2.mean(dim=2)
 
-patches_in2 = patches2 if head._needs_patches else patches2.mean(dim=2)
 state2 = None
 total_loss2_val = 0.0
 
@@ -233,7 +242,14 @@ for i in range(NF, v_len):
     target = gt_cls_target(i, toa_batch, tea_batch).long()
 
     with autocast_ctx[head_name]:
-        feat = patches_in2[:, i - NF, ...]
+        if train_enc:
+            clip = video_data[:, :, i - NF:i, :, :]
+            feat = head.encoder(clip, return_patches=True)
+            if not head._needs_patches:
+                feat = feat.mean(dim=1)
+        else:
+            feat = patches_in2[:, i - NF, ...]
+
         output, state2 = head.forward_temporal_step(feat, state2)
 
     flt = i >= video_len_orig
