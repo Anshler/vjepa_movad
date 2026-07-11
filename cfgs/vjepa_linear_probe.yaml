@@ -47,7 +47,7 @@ snapshot_interval: 5
 enable_validation: true
 validation_epoch_step: 5
 num_workers: 4
-grad_accum: 1
+
 amp_dtype: fp16
 
 # --- Augmentation ---------------------------------------------------------

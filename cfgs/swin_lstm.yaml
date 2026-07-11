@@ -8,8 +8,7 @@
 #   MOVAD:  Swin→AdaptiveAvgPool3d((1,6,6))→flatten(36864)→LN→Linear(36864→1024)→ReLU→Drop→LSTM
 #   Here:   Swin→AdaptiveAvgPool3d((1,6,6))→flatten(36864)→LN→Linear(36864→1024)→ReLU→Drop→LSTM  ✓
 #
-# Remaining differences from MOVAD (not yet addressed):
-#   - AMP autocast fp16 (MOVAD uses no mixed precision — set amp_dtype: fp32 to match)
+# TRAINING: use --batch_size 8 --lr 0.00005 to match MOVAD exactly
 # --------------------------------------------------------------------
 
 # --- Encoder ----------------------------------------------------------------
@@ -17,6 +16,7 @@ model_name: swin_base_ssv2           # → swin_base_patch244_window1677_sthv2
 img_size: 256
 num_frames: 4
 checkpoint_path: pretrained/swin_base_patch244_window1677_sthv2.pth
+compile: false
 
 # --- Temporal model ---------------------------------------------------------
 temporal_model: lstm
@@ -38,7 +38,7 @@ input_shape: [240, 320]              # MOVAD (320 × 240), smaller resolution
 FPS: 10
 
 # --- Training ---------------------------------------------------------------
-batch_size: 4                        # smaller than V-JEPA — Swin-B has ~88M params
+batch_size: 8                        # matches MOVAD (effective batch for per-frame stepping)
 class_weights: [0.3, 0.7]
 epochs: 200
 lr: 0.00005                          # MOVAD v4_2 LR
@@ -46,8 +46,7 @@ snapshot_interval: 10
 enable_validation: true
 validation_epoch_step: 10
 num_workers: 4
-grad_accum: 2                        # effective batch ≈ 2×4 = 8 (matches MOVAD)
-amp_dtype: fp16                      # Swin supports fp16 (set to fp32 to match MOVAD)
+amp_dtype: fp32                      # Swin supports fp16 (set to fp32 to match MOVAD)
 
 # --- Augmentation -----------------------------------------------------------
 horizontal_flip_prob: 0.5
