@@ -673,11 +673,64 @@ class ClsVJEPA(nn.Module):
         # Inverted attention (SlotSSM reference repo style)
         use_inverted_attention: bool = False,
         train_encoder: bool = False,
+        # V-JEPA spatial-grid mode (keep patch tokens, pool spatially like Swin)
+        vjepa_spatial_grid: tuple | None = None,
+        patch_size: int = 16,
+        num_frames: int = 16,
+        tubelet_size: int = 2,
+        img_size: int = 384,
         verbose: bool = True,
     ):
         super().__init__()
         self.temporal_type = temporal_model
         self.train_encoder = train_encoder
+
+        # ---- Layout-agnostic setup ------------------------------------------
+        self._is_swin = isinstance(encoder, SwinEncoder)
+
+        # V-JEPA spatial-grid mode: keep patch tokens, pool spatially (like Swin).
+        # Applies to ALL temporal models — it's an encoder-postprocessing step.
+        # e.g. vjepa_spatial_grid=[6, 6] pools 24×24×2 → 6×6×1 = 36 grid cells.
+        self._use_spatial_grid = (
+            vjepa_spatial_grid is not None
+            and not self._is_swin
+        )
+        if self._use_spatial_grid:
+            self._tubelet_size = tubelet_size
+            # Config default for forward_temporal_step (features pre-encoded
+            # at config num_frames & img_size).  forward() computes n_temp
+            # from the actual input tensor.
+            self._vjepa_n_temp = num_frames // tubelet_size
+            self._grid_size = vjepa_spatial_grid[0] * vjepa_spatial_grid[1]
+            n_spat = img_size // patch_size
+
+            # Learned spatial downsampling: a depthwise Conv3d that learns
+            # to extract spatially-distinct features from each grid region.
+            # AdaptiveAvgPool3d produced nearly identical grid cells (cos-sim
+            # > 0.97) because V-JEPA patch tokens are spatially smooth.
+            # Depthwise conv preserves per-channel spatial structure and lets
+            # the model learn which spatial variations matter — the same role
+            # that hierarchical self-attention plays in Swin.
+            self.vjepa_spatial_pool = nn.Conv3d(
+                embed_dim, embed_dim,
+                kernel_size=(1, n_spat // vjepa_spatial_grid[0],
+                                n_spat // vjepa_spatial_grid[1]),
+                stride=(1, n_spat // vjepa_spatial_grid[0],
+                           n_spat // vjepa_spatial_grid[1]),
+                groups=embed_dim,   # depthwise: each channel learns its own filter
+                bias=False,
+            )
+
+            if verbose:
+                k_h = n_spat // vjepa_spatial_grid[0]
+                k_w = n_spat // vjepa_spatial_grid[1]
+                print(
+                    f"[ClsVJEPA] V-JEPA spatial pool (learned depthwise): "
+                    f"{self._vjepa_n_temp}×{n_spat}×{n_spat}"
+                    f" → 1×{vjepa_spatial_grid[0]}×{vjepa_spatial_grid[1]}"
+                    f" = {self._grid_size} grid cells × {embed_dim}D"
+                    f"  (Conv3d k=1×{k_h}×{k_w}, groups={embed_dim})"
+                )
 
         # ---- Slot-based path ------------------------------------------------
         if temporal_model in ("slotssm", "sparse_slotssm"):
@@ -721,12 +774,13 @@ class ClsVJEPA(nn.Module):
 
         # ---- Standard path --------------------------------------------------
         self._slot_based = False
-        self._is_swin = isinstance(encoder, SwinEncoder)
-
-        # MOVAD architecture for Swin: AdaptiveAvgPool3d((1,6,6)) → 36 grid cells.
-        # The projection LN(36*C) → Linear(36*C→dim_latent) matches MOVAD's
-        # shape_input=36864 → dim_latent=1024 mapping exactly.
-        in_features = embed_dim * encoder.num_patches if self._is_swin else embed_dim
+        self._keep_patches = self._use_spatial_grid
+        if self._keep_patches:
+            in_features = embed_dim * self._grid_size
+        elif self._is_swin:
+            in_features = embed_dim * encoder.num_patches
+        else:
+            in_features = embed_dim
 
         self.bn = nn.LayerNorm(in_features)
         self.lin1 = nn.Linear(in_features, dim_latent)
@@ -800,10 +854,40 @@ class ClsVJEPA(nn.Module):
 
         Slot-based heads need ``[B, N_patches, embed_dim]`` for
         cross-attention.  Swin standard heads need ``[B, 36, embed_dim]``
-        for the MOVAD AdaptiveAvgPool3d projection.  ViT standard heads use
-        ``[B, embed_dim]`` (mean-pooled) and return False here.
+        for the MOVAD AdaptiveAvgPool3d projection.  V-JEPA spatial-grid
+        heads need ``[B, N_patches, embed_dim]`` for AdaptiveAvgPool3d pooling.
+        ViT standard (mean-pooled) heads return False.
         """
-        return self._slot_based or self._is_swin
+        return self._slot_based or self._is_swin or self._keep_patches
+
+    def _spatial_pool_tokens(
+        self, x: torch.Tensor, n_temp: int | None = None,
+    ) -> torch.Tensor:
+        """Reshape patch tokens → spatial grid → learned Conv3d → tokens.
+
+        ``[B, N, D]`` → ``[B, grid_size, D]``  (preserves token structure).
+        ``n_spat`` is derived from the actual token count so this works with
+        any input resolution, not just the config-specified one.
+
+        Uses a learned depthwise Conv3d instead of adaptive average pooling
+        so each grid cell learns to extract spatially-distinct features
+        (adaptive pooling produced near-identical cells from smooth
+        V-JEPA features).
+
+        Args:
+            x: ``[B, N, D]`` patch tokens from V-JEPA encoder.
+            n_temp: Temporal patches. Defaults to config value
+                (``num_frames // tubelet_size``).
+        """
+        B, N, D = x.shape
+        t = n_temp if n_temp is not None else self._vjepa_n_temp
+        h = int((N / t) ** 0.5)
+        x = x.reshape(B, t, h, h, D)
+        x = x.permute(0, 4, 1, 2, 3)                       # [B, D, T, H, W]
+        x = self.vjepa_spatial_pool(x)                       # [B, D, T, h, w]  (learned spatial)
+        x = x.mean(dim=2)                                    # [B, D, h, w]     (avg temporally)
+        x = x.flatten(2).transpose(1, 2)                     # [B, grid_size, D]
+        return x
 
     def forward_temporal_step(
         self, x: torch.Tensor, state: torch.Tensor | tuple | None = None,
@@ -813,6 +897,7 @@ class ClsVJEPA(nn.Module):
         Args:
             x:     For standard ViT path: ``[B, embed_dim]`` (spatially mean-pooled).
                    For Swin standard path: ``[B, 36, embed_dim]`` (grid cells).
+                   For V-JEPA spatial-grid path: ``[B, N_patches, embed_dim]``.
                    For slot path: ``[B, N_patches, embed_dim]`` (full patch tokens).
             state: temporal-model state (MambaCache or LSTM tuple).
 
@@ -821,6 +906,8 @@ class ClsVJEPA(nn.Module):
             new_state: updated temporal-model state.
         """
         if self._slot_based:
+            if self._use_spatial_grid:
+                x = self._spatial_pool_tokens(x)
             slots, new_state = self.temporal(x, state)
             D = slots.shape[-1]
             scores = (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)
@@ -829,7 +916,9 @@ class ClsVJEPA(nn.Module):
             return self.classifier(pooled), new_state
 
         # Standard path: bn → lin1 → relu → temporal → lin2 → relu → lin3
-        if self._is_swin:
+        if self._keep_patches:
+            x = self._spatial_pool_tokens(x).reshape(x.shape[0], -1)   # [B, grid_size*D]
+        elif self._is_swin:
             x = x.flatten(1)    # [B, 36, C] → [B, 36*C]  (MOVAD projection)
         x = self.bn(x)
         x = F.relu(self.lin1(x))
@@ -843,6 +932,9 @@ class ClsVJEPA(nn.Module):
     def forward(self, x, state=None):
         if self._slot_based:
             patches = self.encoder(x, return_patches=True)    # [B, N, embed_dim]
+            if self._use_spatial_grid:
+                n_temp = x.shape[2] // self._tubelet_size
+                patches = self._spatial_pool_tokens(patches, n_temp)
             slots, new_state = self.temporal(patches, state)  # [B, K, D]
             # Learned attention-pool: query attends to slots
             D = slots.shape[-1]
@@ -851,7 +943,11 @@ class ClsVJEPA(nn.Module):
             pooled = (attn.unsqueeze(-1) * slots).sum(dim=1)   # [B, D]
             return self.classifier(pooled), new_state
 
-        if self._is_swin:
+        if self._keep_patches:
+            n_temp = x.shape[2] // self._tubelet_size
+            x = self.encoder(x, return_patches=True)           # [B, N, D]
+            x = self._spatial_pool_tokens(x, n_temp).reshape(x.shape[0], -1)
+        elif self._is_swin:
             x = self.encoder(x, return_patches=True)           # [B, 36, embed_dim]
             x = x.flatten(1)                                   # [B, 36*C]
         else:
@@ -940,8 +1036,13 @@ class MultiHeadVJEPA(nn.Module):
                 top_k=head_cfg.get("top_k", 16),
                 eps_random=head_cfg.get("eps_random", 0.0),
                 use_inverted_attention=head_cfg.get("use_inverted_attention", False),
-                verbose=False,
                 train_encoder=train_encoder,
+                vjepa_spatial_grid=head_cfg.get("vjepa_spatial_grid", None),
+                patch_size=head_cfg.get("patch_size", 16),
+                num_frames=head_cfg.get("num_frames", 16),
+                tubelet_size=head_cfg.get("tubelet_size", 2),
+                img_size=head_cfg.get("img_size", 384),
+                verbose=False,
             )
 
         # Summarise
@@ -1020,6 +1121,12 @@ def build_cls_vjepa(cfg) -> ClsVJEPA:
         top_k=cfg.get("top_k", 16),
         eps_random=cfg.get("eps_random", 0.0),
         use_inverted_attention=cfg.get("use_inverted_attention", False),
+        train_encoder=cfg.get("train_encoder", False),
+        vjepa_spatial_grid=cfg.get("vjepa_spatial_grid", None),
+        patch_size=cfg.get("patch_size", 16),
+        num_frames=cfg.get("num_frames", 16),
+        tubelet_size=cfg.get("tubelet_size", 2),
+        img_size=cfg.get("img_size", 384),
     ).to(cfg.device)
 
     return model

@@ -30,7 +30,7 @@ NF: 4
 VCL: 8                               # matches MOVAD v4_2
 
 data_mean: [0.5, 0.5, 0.5]
-data_path: ./data/dota
+data_path: /mnt/d/Users/Chrysenberg69420/Downloads/DoTA_dataset
 data_std: [0.5, 0.5, 0.5]
 dataset: Dota
 image_shape: [720, 1280]

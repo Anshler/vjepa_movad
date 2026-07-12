@@ -135,17 +135,15 @@ with torch.no_grad():
         if patches_check.shape[2] > 1:
             single_clip = patches_check[0, 0]  # [N_patches, embed_dim] — first clip
             _sim_report(single_clip, "patches within ONE clip")
+    # Flatten to [total_tokens, D] for a summary similarity check.
+    # Cap tokens to avoid the same O(N²×D) broadcast that _sim_report guards against
+    # (9216 tokens × 768D × 4 bytes = 260 GiB broadcast intermediate).
     feats_flat = patches_check.reshape(-1, patches_check.shape[-1]) if head._needs_patches else patches_check.mean(dim=2).reshape(-1, patches_check.shape[-1])
-    sims = F.cosine_similarity(feats_flat.unsqueeze(0), feats_flat.unsqueeze(1), dim=-1)
-    mask = ~torch.eye(feats_flat.shape[0], dtype=torch.bool, device=feats_flat.device)
-    off_diag = sims[mask]
-    print(f"Feature sim (final): min={off_diag.min():.4f} max={off_diag.max():.4f} mean={off_diag.mean():.4f}")
-    if off_diag.min() > 0.95:
-        print("  ⚠ Features near-identical on random noise — loss floor expected ~0.2–0.3")
-    elif off_diag.max() < 0.5:
-        print("  ✓ Features well-separated — should converge cleanly")
-    else:
-        print("  ~ Moderate separation")
+    n_feats = feats_flat.shape[0]
+    if n_feats > MAX_PAIRWISE:
+        idx = torch.randperm(n_feats, device=feats_flat.device)[:MAX_PAIRWISE]
+        feats_flat = feats_flat[idx]
+    _sim_report(feats_flat.unsqueeze(0), "features (final)")
 
 # --- Overfit ---
 for epoch in range(args.epochs):

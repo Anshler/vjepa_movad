@@ -33,7 +33,7 @@ CFG_DIR = os.path.join(_REPO_ROOT, "cfgs")
 
 WARMUP = 30
 MEASURE = 200
-B, F, H, W = 1, 16, 256, 256
+B, F, H, W = 1, 4, 384, 384
 TARGET_FPS = 10.0
 
 _AMP_CHOICES = {

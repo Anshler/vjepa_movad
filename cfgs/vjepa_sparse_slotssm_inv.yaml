@@ -15,6 +15,7 @@ tubelet_size: 2
 patch_size: 16
 checkpoint_path: null
 checkpoint_key: ema_encoder
+vjepa_spatial_grid: [6, 6]
 pool: mean                          # ignored — Sparse SlotSSM uses full patches
 
 # --- Temporal model -------------------------------------------------------
