@@ -783,7 +783,15 @@ class ClsVJEPA(nn.Module):
             patches = self.encoder(mega_batch, return_patches=True)     # [B * n_clips, N_patches, embed_dim]
 
         N_patches = patches.shape[1]                                     # encoder-agnostic
-        patches = patches.view(B, n_clips, N_patches, -1)               # [B, n_clips, N_patches, embed_dim]
+        # mega_batch is clip-major: [v0_c0, v1_c0, ..., v_{B-1}_c0, v0_c1, ...].
+        # .view(B, n_clips, ...) expects batch-major, so reshape clip-major
+        # first → transpose to get the correct grouping.
+        patches = (
+            patches
+            .view(n_clips, B, N_patches, -1)          # [n_clips, B, N_patches, embed_dim]
+            .transpose(0, 1)                            # [B, n_clips, N_patches, embed_dim]
+            .contiguous()
+        )
         return patches
 
     @property

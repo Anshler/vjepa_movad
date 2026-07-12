@@ -1,20 +1,21 @@
 """
 Training + validation smoke test — synthetic data, one step each.
+Supports all configs (ViT, Swin, LSTM, Mamba, SlotSSM variants).
 
 Verifies:
   - Model build from config
   - encode_video_clips with autocast (train + val)
   - Per-frame temporal loop with autocast (train + val)
   - Loss compute, backward, optimizer step (no NaNs, loss decreases)
-  - _evaluate_model does not crash with autocast
+  - Swin-specific architecture checks (grid cells, projection sizes)
 
 Usage (from WSL):
     conda activate vjepa2-312
     cd /mnt/d/Users/Chrysenberg69420/VSCodeProjects/vjepa_movad
     python tests/test_training.py
+    python tests/test_training.py --config swin_lstm.yaml
     python tests/test_training.py --amp fp16
-    python tests/test_training.py --checkpoint ~/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
-    python tests/test_training.py --train_encoder --checkpoint ~/vjepa2-checkpoints/vjepa2_1_vitb_dist_vitG_384.pt
+    python tests/test_training.py --train_encoder
 """
 from __future__ import annotations
 
@@ -49,21 +50,24 @@ CFG_DIR = os.path.join(_REPO_ROOT, "cfgs")
 
 _AMP_CHOICES = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
 parser = argparse.ArgumentParser()
+parser.add_argument("--config", default="vjepa_mamba.yaml",
+                    help="Config YAML in cfgs/ (default: vjepa_mamba.yaml)")
 parser.add_argument("--amp", default="fp16", choices=list(_AMP_CHOICES),
                     help="AMP dtype (default: fp16)")
 parser.add_argument("--checkpoint", default=None,
-                    help="Path to a pretrained V-JEPA checkpoint (.pt)")
+                    help="Path to a pretrained checkpoint (.pt)")
 parser.add_argument("--train_encoder", action="store_true", default=False,
-                    help="Unfreeze the V-JEPA encoder and train jointly with the temporal head")
+                    help="Unfreeze the V-JEPA encoder and train jointly")
 args = parser.parse_args()
 AMP_DTYPE = _AMP_CHOICES[args.amp]
-CHECKPOINT_PATH = args.checkpoint  # None → don't load any weights
+CHECKPOINT_PATH = args.checkpoint
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 
 print(f"Device: {DEVICE}")
 print(f"mamba_ssm: {_HAS_MAMBA_SSM}")
+print(f"config: {args.config}")
 if CHECKPOINT_PATH:
     print(f"checkpoint: {CHECKPOINT_PATH}")
 else:
@@ -85,18 +89,37 @@ def load_cfg(name: str) -> EasyDict:
     return cfg
 
 
-# Use a single-head config (closest to normal training)
-cfg = load_cfg("vjepa_mamba.yaml")
+cfg = load_cfg(args.config)
 cfg.train_encoder = args.train_encoder
+head_name = os.path.splitext(args.config)[0].replace("vjepa_", "").replace("swin_", "")
 cfg._head_cfgs_flat = [dict(cfg)]
-cfg._head_cfgs_flat[0]["name"] = "mamba_test"
+cfg._head_cfgs_flat[0]["name"] = head_name
 
 model = build_multi_head_vjepa(cfg)
 head_name = next(iter(model.heads.keys()))
 head = model.heads[head_name]
-assert list(model.heads.keys()) == ["mamba_test"]
+is_swin = head._is_swin
+is_vit = not is_swin and not args.config.startswith("swin")
 
-# Per-head infrastructure (mirrors _train)
+# --- Architecture diagnostics (Swin-specific + general) ---
+print(f"\nArchitecture: {'Swin' if is_swin else 'ViT'} backbone  |  temporal: {head.temporal_type}")
+print(f"  _needs_patches: {head._needs_patches}")
+if is_swin:
+    embed_dim = head.encoder.embed_dim
+    num_patches = head.encoder.num_patches
+    print(f"  encoder.embed_dim: {embed_dim}")
+    print(f"  encoder.num_patches: {num_patches}")
+    print(f"  encoder.avgpool: AdaptiveAvgPool3d output_size=(1,{int(num_patches**0.5)},{int(num_patches**0.5)})")
+    print(f"  movad_proj_in: {embed_dim}×{num_patches}={embed_dim * num_patches}  →  {head.lin1.out_features}")
+    assert head.lin1.in_features == embed_dim * num_patches, \
+        f"Expected lin1.in_features={embed_dim * num_patches}, got {head.lin1.in_features}"
+    if head.temporal_type == "lstm":
+        assert head.lin2.in_features == head.lin1.out_features, \
+            f"LSTM: expected lin2.in_features={head.lin1.out_features} (unidirectional), got {head.lin2.in_features}"
+        print(f"  ✓ Unidirectional LSTM: lin2 in={head.lin2.in_features} → out={head.lin2.out_features}")
+    print(f"  ✓ MOVAD Swin projection verified")
+
+# Per-head infrastructure
 head_cfgs: dict[str, dict] = {}
 criterion: dict[str, torch.nn.Module] = {}
 optimizer: dict[str, torch.optim.Optimizer] = {}
@@ -116,7 +139,6 @@ for name in list(model.heads.keys()):
     head_easy.device = DEVICE
     criterion[name] = build_loss(head_easy)
 
-    # When training the encoder, pass the full model (encoder + head) to the optimizer
     if args.train_encoder:
         opt, _ = build_optimizer(EasyDict({"lr": cfg.lr}), model, None)
     else:
@@ -130,36 +152,30 @@ for name in list(model.heads.keys()):
     )
 
 model.to(DEVICE)
-model.train()  # temporal heads in train mode, encoder in train mode if unfrozen
+model.train()
 
-print(f"\nHead: {head_name}  temporal: {head.temporal_type}")
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print(f"Trainable params: {trainable:,} (encoder {'unfrozen' if args.train_encoder else 'frozen'})")
 
 # ---------------------------------------------------------------------------
-# Synthetic data — simulate 2 videos of 12 frames each (padded to v_len=12)
+# Synthetic data
 # ---------------------------------------------------------------------------
 B = 2
 NF = cfg.get("num_frames", 4)
-v_len = NF + 8  # enough clips for temporal loop (NF+8 clips → 8 per-frame outputs)
+v_len = NF + 8
 img_size = cfg.get("img_size", 256)
 
-# Raw video [B, C, T, H, W] — already padded by collator
 video_data = torch.randn(B, 3, v_len, img_size, img_size, device=DEVICE)
 
-# data_info columns: [v_len_orig, video_id, a_start, a_end, label, ..., ego, night, has_obj]
-# Make one video fully normal, the other with a short anomaly
 data_info = torch.zeros(B, 11, device=DEVICE)
-data_info[:, 0] = v_len           # v_len_orig (no padding truncation)
-data_info[:, 1] = torch.arange(B) # video_id
-data_info[:, 2] = -1              # a_start (-1 = normal)
-data_info[:, 3] = -1              # a_end
-data_info[:, 4] = -1              # label (-1 = normal)
-
-# Make batch[1] anomalous: anomaly from frame 6 to 9
-data_info[1, 2] = 6   # a_start
-data_info[1, 3] = 9   # a_end
-data_info[1, 4] = 1   # label
+data_info[:, 0] = v_len
+data_info[:, 1] = torch.arange(B)
+data_info[:, 2] = -1
+data_info[:, 3] = -1
+data_info[:, 4] = -1
+data_info[1, 2] = 6    # anomaly start
+data_info[1, 3] = 9    # anomaly end
+data_info[1, 4] = 1    # label
 
 # ---------------------------------------------------------------------------
 # 1.  TRAINING  —  one encode + per-frame temporal loop + backward
@@ -168,12 +184,15 @@ print("\n" + "=" * 70)
 print("1. TRAINING — one step")
 print("=" * 70)
 
-# Mega-batch encode (frozen encoder) or per-frame (training encoder)
 train_enc = args.train_encoder
 if not train_enc:
     with autocast_ctx[head_name]:
         patches = model.encode_video_clips(video_data, NF)
     print(f"  patches: {tuple(patches.shape)}  dtype={patches.dtype}")
+    if is_swin:
+        assert patches.shape[2] == head.encoder.num_patches, \
+            f"Swin: expected {head.encoder.num_patches} grid cells, got {patches.shape[2]}"
+        print(f"  ✓ Swin patches: {patches.shape[2]} grid cells × {patches.shape[3]} channels")
     patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
 toa_batch = data_info[:, 2]
@@ -189,7 +208,6 @@ for i in range(NF, v_len):
 
     with autocast_ctx[head_name]:
         if train_enc:
-            # Encode each clip individually — independent graph per frame
             clip = video_data[:, :, i - NF:i, :, :]
             feat = head.encoder(clip, return_patches=True)
             if not head._needs_patches:
@@ -208,7 +226,6 @@ for i in range(NF, v_len):
 
     loss = criterion[head_name](output, target)
 
-    # MOVAD-style: per-frame backward + step
     optimizer[head_name].zero_grad()
     loss.backward()
     optimizer[head_name].step()
@@ -218,7 +235,6 @@ for i in range(NF, v_len):
 
 avg_loss = total_loss_val / max(frame_count, 1)
 print(f"  avg_loss={avg_loss:.4f}  frames={frame_count}")
-print(f"  output range: [{output.min().item():.4f}, {output.max().item():.4f}]")
 print(f"  ✓ training step OK")
 
 loss_before = avg_loss
@@ -281,27 +297,23 @@ print("=" * 70)
 
 model.eval()
 
-# Simulate full-video validation (VCL=None → v_len frames)
-v_len_val = NF + 12  # realistic: short DoTA video, but at least NF+1 frames
+v_len_val = NF + 12
 video_val = torch.randn(1, 3, v_len_val, img_size, img_size, device=DEVICE)
 data_info_val = torch.zeros(1, 11, device=DEVICE)
-data_info_val[:, 0] = v_len_val    # v_len_orig (full video)
-data_info_val[:, 1] = 0            # video_id
-data_info_val[:, 2] = v_len_val - 10  # a_start (anomalous region)
-data_info_val[:, 3] = v_len_val - 6   # a_end
-data_info_val[:, 4] = 1            # label
+data_info_val[:, 0] = v_len_val
+data_info_val[:, 1] = 0
+data_info_val[:, 2] = v_len_val - 10
+data_info_val[:, 3] = v_len_val - 6
+data_info_val[:, 4] = 1
 
 with torch.no_grad():
-    # Encode with autocast (matches fixed _evaluate_model)
     with autocast_ctx[head_name]:
         patches_val = model.encode_video_clips(video_val, NF)
     print(f"  val patches: {tuple(patches_val.shape)}  dtype={patches_val.dtype}")
 
     n_clips = v_len_val - NF
     patches_in_val = patches_val if head._needs_patches else patches_val.mean(dim=2)
-    n_patches = patches_in_val.shape[2]
 
-    # Per-frame temporal loop with autocast (matches fixed _evaluate_model)
     state_val = None
     outputs_val = torch.zeros(1, n_clips, device=DEVICE)
     for i in range(NF, v_len_val):
@@ -318,9 +330,38 @@ assert not torch.isnan(outputs_val).any(), "NaN in validation outputs!"
 print("  ✓ validation step OK")
 
 # ---------------------------------------------------------------------------
+# 4.  Full-movie forward (no RNN state)
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print("4. Forward (full-movie) — verify encoder dimensions")
+print("=" * 70)
+
+model.eval()
+video_full = torch.randn(2, 3, NF, img_size, img_size, device=DEVICE)
+
+with torch.no_grad():
+    with autocast_ctx[head_name]:
+        out = model.heads[head_name](video_full)
+    out_tensor = out[0] if isinstance(out, tuple) else out
+    print(f"  forward output: {tuple(out_tensor.shape)}")
+
+    # Encoder patch output dimensions
+    if is_swin:
+        encoder_out = head.encoder(video_full, return_patches=True)
+        print(f"  encoder patches: {tuple(encoder_out.shape)}  (expect [2, {head.encoder.num_patches}, {head.encoder.embed_dim}])")
+        assert encoder_out.shape[1] == head.encoder.num_patches, \
+            f"Expected {head.encoder.num_patches} patches, got {encoder_out.shape[1]}"
+        print(f"  ✓ Swin patch dimensions verified")
+
+    encoder_vec = head.encoder(video_full, return_patches=False)
+    print(f"  encoder vector: {tuple(encoder_vec.shape)}  (expect [2, {head.encoder.embed_dim}])")
+
+print("  ✓ full-movie forward OK")
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 70)
-print(f"All training + validation smoke tests passed!  (amp={args.amp})")
-print("Autocast wrapping verified for:  encode_video_clips + forward_temporal_step")
+print(f"All training + validation smoke tests passed!  (config={args.config}  amp={args.amp})")
+print(f"  Backbone: {'Swin' if is_swin else 'ViT'}  |  Temporal: {head.temporal_type}")
 print("=" * 70)
