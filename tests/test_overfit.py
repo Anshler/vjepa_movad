@@ -27,7 +27,7 @@ from movad_core.losses import build_loss
 from movad_core.optim import build_optimizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="cfgs/vjepa_v1.yaml",
+parser.add_argument("--config", default="cfgs/vjepa_mamba.yaml",
                     help="Path to config YAML (e.g. cfgs/swin_lstm.yaml or cfgs/vjepa_v1.yaml)")
 parser.add_argument("--checkpoint", default=None,
                     help="Override checkpoint path (uses config value if not set)")
@@ -92,6 +92,60 @@ for b in range(B // 2, B):
 print(f"Synthetic: {B} videos, {VCL} frames, labels={di[:, 4].int().tolist()}")
 n_params = sum(p.numel() for p in head.parameters() if p.requires_grad)
 print(f"Trainable params in head: {n_params:,}")
+
+# --- Feature diversity check ---
+MAX_PAIRWISE = 2000  # cap tokens to avoid O(N²×D) broadcast OOM
+
+def _sim_report(t, label):
+    """Print pairwise cosine similarity stats for a set of vectors.
+    Caps at MAX_PAIRWISE tokens (random subset) to stay within GPU memory."""
+    flat = t.reshape(-1, t.shape[-1])
+    n = flat.shape[0]
+    if n > MAX_PAIRWISE:
+        idx = torch.randperm(n, device=flat.device)[:MAX_PAIRWISE]
+        flat = flat[idx]
+        n_label = f"sampled {MAX_PAIRWISE}/{n}"
+    else:
+        n_label = str(n)
+    # Chunked all-pairs cosine sim to avoid the [N,N,D] broadcast
+    sims = []
+    chunk = 128
+    for i in range(0, flat.shape[0], chunk):
+        q = flat[i : i + chunk]                              # [c, D]
+        s = F.cosine_similarity(
+            q.unsqueeze(1), flat.unsqueeze(0), dim=-1)       # [c, N]
+        sims.append(s)
+    sims = torch.cat(sims, dim=0)                            # [N, N]
+    mask = ~torch.eye(sims.shape[0], dtype=torch.bool, device=sims.device)
+    off = sims[mask]
+    print(f"  {label}: tokens={n_label}  sim=[{off.min():.4f}, {off.max():.4f}]  mean={off.mean():.4f}")
+
+with torch.no_grad():
+    if args.train_encoder:
+        patches_check = head.encoder(vd[:, :, :NF, :, :], return_patches=True)
+        # patches_check: [B, N_patches, embed_dim]
+        _sim_report(patches_check, "patch tokens")
+        _sim_report(patches_check.mean(dim=1, keepdim=True), "pooled (mean)")
+    else:
+        patches_check = model.encode_video_clips(vd, NF)
+        # patches_check: [B, n_clips, N_patches, embed_dim]
+        _sim_report(patches_check, "patch tokens (all)")
+        _sim_report(patches_check.mean(dim=2, keepdim=True), "pooled (mean over patches)")
+        # Also check: are patches within one clip diverse, or all collapsed?
+        if patches_check.shape[2] > 1:
+            single_clip = patches_check[0, 0]  # [N_patches, embed_dim] — first clip
+            _sim_report(single_clip, "patches within ONE clip")
+    feats_flat = patches_check.reshape(-1, patches_check.shape[-1]) if head._needs_patches else patches_check.mean(dim=2).reshape(-1, patches_check.shape[-1])
+    sims = F.cosine_similarity(feats_flat.unsqueeze(0), feats_flat.unsqueeze(1), dim=-1)
+    mask = ~torch.eye(feats_flat.shape[0], dtype=torch.bool, device=feats_flat.device)
+    off_diag = sims[mask]
+    print(f"Feature sim (final): min={off_diag.min():.4f} max={off_diag.max():.4f} mean={off_diag.mean():.4f}")
+    if off_diag.min() > 0.95:
+        print("  ⚠ Features near-identical on random noise — loss floor expected ~0.2–0.3")
+    elif off_diag.max() < 0.5:
+        print("  ✓ Features well-separated — should converge cleanly")
+    else:
+        print("  ~ Moderate separation")
 
 # --- Overfit ---
 for epoch in range(args.epochs):
