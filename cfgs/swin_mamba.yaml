@@ -40,7 +40,7 @@ FPS: 10
 batch_size: 4                        # smaller than V-JEPA — Swin-B has ~88M params
 class_weights: [0.3, 0.7]
 epochs: 200
-lr: 0.0001                           # Mamba default (higher than LSTM's 5e-5)
+lr: 0.01                           # Mamba default (higher than LSTM's 5e-5)
 snapshot_interval: 10
 enable_validation: true
 validation_epoch_step: 10

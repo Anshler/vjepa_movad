@@ -42,7 +42,7 @@ FPS: 10
 batch_size: 8
 class_weights: [0.3, 0.7]
 epochs: 30
-lr: 0.0001
+lr: 0.01
 snapshot_interval: 5
 enable_validation: true
 validation_epoch_step: 5
