@@ -1,9 +1,10 @@
 """
 Fast single-config overfit test.
 Usage:
-    python tests/test_overfit.py --train_encoder --lr 0.00005 --epochs 100
+    python tests/test_overfit.py --train_encoder --lr 0.005 --epochs 100
     python tests/test_overfit.py                    # frozen, lr=0.01
     python tests/test_overfit.py --train_encoder    # trainable, lr=0.01
+    python tests/test_overfit.py --softmax          # with old double-softmax behavior
 """
 from __future__ import annotations
 
@@ -33,12 +34,12 @@ parser.add_argument("--checkpoint", default=None,
 parser.add_argument("--epochs", type=int, default=100)
 parser.add_argument("--lr", type=float, default=0.01)
 parser.add_argument("--train_encoder", action="store_true", default=False)
-parser.add_argument("--no_softmax", action="store_true", default=False,
-                    help="Disable double-softmax (apply_softmax=False)")
+parser.add_argument("--softmax", action="store_true", default=False,
+                    help="Enable double-softmax (for comparing with old behavior)")
 args = parser.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-apply_softmax = not args.no_softmax
+apply_softmax = args.softmax
 print(f"Device: {DEVICE}  |  train_encoder={args.train_encoder}  |  lr={args.lr}  |  epochs={args.epochs}  |  softmax={apply_softmax}")
 
 torch.manual_seed(42)
@@ -94,6 +95,7 @@ print(f"Trainable params in head: {n_params:,}")
 
 # --- Overfit ---
 for epoch in range(args.epochs):
+    print(epoch)
     if args.train_encoder:
         patches_in = vd
     else:
@@ -156,7 +158,7 @@ for epoch in range(args.epochs):
                 else:
                     feat = patches_in_p[:, i - NF, ...]
                 out, state_p = head.forward_temporal_step(feat, state_p)
-                if cfg.get("apply_softmax", True):
+                if cfg.get("apply_softmax", False):
                     out = out.softmax(dim=1)
                 preds.append(out[:, 1].cpu())
             all_preds = torch.stack(preds, dim=1)

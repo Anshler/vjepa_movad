@@ -424,7 +424,7 @@ def train(cfg, model, traindata_loader, begin_epoch,
             target[flt] = -100
             output[flt] = -100
 
-            if head_cfgs[head_name].get("apply_softmax", True):
+            if head_cfgs[head_name].get("apply_softmax", False):
                 output = output.softmax(dim=1)
 
             loss = criterion[head_name](output, target)
@@ -676,7 +676,7 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
                 target[flt] = -100
                 output[flt] = -100
 
-                if cfg.get("apply_softmax", True):
+                if cfg.get("apply_softmax", False):
                     output = output.softmax(dim=1)
 
                 targets[:, i - fb] = target.clone()

@@ -36,7 +36,7 @@ use_inverted_attention: true        # inverted cross-attn + sparse gate
 # --- Data -----------------------------------------------------------------
 NF: 4
 VCL: 16
-apply_softmax: true
+
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota
 data_std: [0.5, 0.5, 0.5]

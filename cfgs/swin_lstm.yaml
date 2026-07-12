@@ -28,7 +28,7 @@ rnn_state_size: 1024
 # --- Data -------------------------------------------------------------------
 NF: 4
 VCL: 8                               # matches MOVAD v4_2
-apply_softmax: true
+
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota
 data_std: [0.5, 0.5, 0.5]

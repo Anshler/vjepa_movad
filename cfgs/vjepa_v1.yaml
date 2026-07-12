@@ -26,7 +26,7 @@ rnn_cell_num: 3
 # --- Data -----------------------------------------------------------------
 NF: 4
 VCL: 16
-apply_softmax: true
+
 data_mean: [0.5, 0.5, 0.5]
 data_path: ./data/dota
 data_std: [0.5, 0.5, 0.5]

@@ -28,7 +28,7 @@ mamba_version: mamba2               # Mamba2 (default in SlotSSM repo)
 # --- Data -----------------------------------------------------------------
 NF: 4
 VCL: 8
-apply_softmax: true
+
 data_mean: [0.5, 0.5, 0.5]
 data_path: null
 data_std: [0.5, 0.5, 0.5]

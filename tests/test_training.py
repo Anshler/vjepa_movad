@@ -221,7 +221,7 @@ for i in range(NF, v_len):
     target[flt] = -100
     output[flt] = -100
 
-    if head_cfgs[head_name].get("apply_softmax", True):
+    if head_cfgs[head_name].get("apply_softmax", False):
         output = output.softmax(dim=1)
 
     loss = criterion[head_name](output, target)
@@ -271,7 +271,7 @@ for i in range(NF, v_len):
     flt = i >= video_len_orig
     target[flt] = -100
     output[flt] = -100
-    if head_cfgs[head_name].get("apply_softmax", True):
+    if head_cfgs[head_name].get("apply_softmax", False):
         output = output.softmax(dim=1)
     loss = criterion[head_name](output, target)
     optimizer[head_name].zero_grad()
@@ -320,7 +320,7 @@ with torch.no_grad():
         feat = patches_in_val[:, i - NF, ...].float()
         with autocast_ctx[head_name]:
             output, state_val = head.forward_temporal_step(feat, state_val)
-        if head_cfgs[head_name].get("apply_softmax", True):
+        if head_cfgs[head_name].get("apply_softmax", False):
             output = output.softmax(dim=1)
         outputs_val[:, i - NF] = output[:, 1]
 
