@@ -52,6 +52,8 @@ def parse_args():
                         help="Device override (default: cuda if available)")
     parser.add_argument("--verify", action="store_true",
                         help="Only encode 1 video, save it, and verify the output shape")
+    parser.add_argument("--amp", default="fp16", choices=["fp32", "fp16", "bf16"],
+                        help="AMP dtype for encoder pass (default: fp16)")
     return parser.parse_args()
 
 
@@ -173,7 +175,12 @@ def main():
     # --- Encode & save -----------------------------------------------------
     # Accumulate in memory and flush to disk in chunks — per-video torch.save
     # on a network/WSL mount can bottleneck the whole pipeline.
-    print(f"Encoding {len(val_dataset)} videos → {embed_dir}")
+    _AMP_DTYPE = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+    amp_dtype = _AMP_DTYPE[args.amp]
+    amp_ctx = (torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype
+               else __import__("contextlib").nullcontext())
+
+    print(f"Encoding {len(val_dataset)} videos → {embed_dir}  (AMP: {args.amp})")
     global_idx = 0
 
     for video_data, data_info in tqdm(val_loader, desc="Encoding val"):
@@ -182,7 +189,7 @@ def main():
         data_info = data_info.to(cfg.device, non_blocking=True)
         video_data = torch.swapaxes(video_data, 1, 2)  # [1, C, T, H, W]
 
-        with torch.no_grad():
+        with torch.no_grad(), amp_ctx:
             patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, N, D]
 
         # Move to CPU immediately and free GPU tensors — full-video

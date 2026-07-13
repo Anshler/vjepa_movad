@@ -814,39 +814,44 @@ class ClsVJEPA(nn.Module):
                 nn.ModuleList([self.lin1, self.lin2, self.lin3, self.bn]),
             )
 
-    def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def encode_video_clips(
+        self, x: torch.Tensor, num_frames: int, max_clips_per_batch: int = 32,
+    ) -> torch.Tensor:
         """Run the encoder over every NF-frame sliding window in one batch of videos.
 
-        Stacks all stride-1 clips into a mega-batch and encodes in a single
-        ``no_grad`` pass.  Memory scales with ``batch_size × VCL`` — keep VCL
-        reasonable to avoid OOM.
+        Processes all clips at once in mega-batch, splitted in chunks of ``max_clips_per_batch`` to bound GPU memory.
 
         Returns ``[B, n_clips, N_patches, embed_dim]`` where ``n_clips = T - num_frames``.
         """
-        B, C, T, H, W = x.shape
+        B, _, T, _, _ = x.shape
         n_clips = T - num_frames
 
-        clips = []
-        for i in range(num_frames, T):
-            clips.append(x[:, :, i - num_frames:i, :, :])              # [B, C, NF, H, W]  (view)
-        mega_batch = torch.cat(clips, dim=0)                            # [B * n_clips, C, NF, H, W]
-
-        # When training the encoder, let gradients flow; otherwise freeze
+        # Stack all clips into one mega-batch in a single encoder pass for higher throughput.
+        # all_clips[i] = x[:, :, i:i+NF, ...]  →  [B, C, NF, H, W]
+        # torch.cat(dim=0) produces clip-major ordering:
+        #   [v0_c0, v1_c0, ..., v_{B-1}_c0, v0_c1, v1_c1, ..., v_{B-1}_cN]
+        # After encoding, view(csz, B, N, D).transpose(0,1) recovers:
+        #   [B, csz, N_patches, D]  — where out[b, c] = video b's clip c.
+        #
+        # During training VCL keeps n_clips small (e.g. 4–12), so a single
+        # chunk handles everything.  Chunking only activates for full-video
+        # encoding (precompute / eval) where n_clips can reach hundreds.
+        all_clips = [x[:, :, i - num_frames:i, :, :] for i in range(num_frames, T)]
         ctx = torch.no_grad() if not self.train_encoder else torch.enable_grad()
-        with ctx:
-            patches = self.encoder(mega_batch, return_patches=True)     # [B * n_clips, N_patches, embed_dim]
+        chunks_out = []
+        for start in range(0, n_clips, max_clips_per_batch):
+            end = min(start + max_clips_per_batch, n_clips)
+            chunk = torch.cat(all_clips[start:end], dim=0)    # [csz * B, C, NF, H, W]
 
-        N_patches = patches.shape[1]                                     # encoder-agnostic
-        # mega_batch is clip-major: [v0_c0, v1_c0, ..., v_{B-1}_c0, v0_c1, ...].
-        # .view(B, n_clips, ...) expects batch-major, so reshape clip-major
-        # first → transpose to get the correct grouping.
-        patches = (
-            patches
-            .view(n_clips, B, N_patches, -1)          # [n_clips, B, N_patches, embed_dim]
-            .transpose(0, 1)                            # [B, n_clips, N_patches, embed_dim]
-            .contiguous()
-        )
-        return patches
+            with ctx:
+                p = self.encoder(chunk, return_patches=True)   # [csz * B, N_patches, D]
+
+            csz = end - start
+            N_patches = p.shape[1]
+            p = p.view(csz, B, N_patches, -1).transpose(0, 1)  # [B, csz, N_patches, D]
+            chunks_out.append(p)
+
+        return torch.cat(chunks_out, dim=1).contiguous()        # [B, n_clips, N_patches, D]
 
     @property
     def _needs_patches(self) -> bool:
@@ -1066,7 +1071,9 @@ class MultiHeadVJEPA(nn.Module):
             self.encoder.eval()
         return self
 
-    def encode_video_clips(self, x: torch.Tensor, num_frames: int) -> torch.Tensor:
+    def encode_video_clips(
+        self, x: torch.Tensor, num_frames: int, max_clips_per_batch: int = 32,
+    ) -> torch.Tensor:
         """Run the ViT encoder once over all stride-1 clips in one batch.
 
         Delegates to the first head's :meth:`ClsVJEPA.encode_video_clips`
@@ -1077,7 +1084,7 @@ class MultiHeadVJEPA(nn.Module):
         Standard ViT heads call ``.mean(dim=2)`` on this; slot-based and
         Swin standard heads use the full tensor (checked via ``head._needs_patches``).
         """
-        return next(iter(self.heads.values())).encode_video_clips(x, num_frames)
+        return next(iter(self.heads.values())).encode_video_clips(x, num_frames, max_clips_per_batch)
 
 
 # ===========================================================================
