@@ -160,16 +160,18 @@ def _count_frozen(module: nn.Module) -> int:
     return sum(p.numel() for p in module.parameters() if not p.requires_grad)
 
 
-def _print_param_summary(encoder, temporal, classifier, extra_parts=None):
+def _print_param_summary(encoder, temporal, classifier, extra_parts=None, spatial_pool=None):
     frozen = _count_frozen(encoder)
-    trainable = _count(temporal) + _count(classifier)
+    sp_count = _count(spatial_pool) if spatial_pool is not None else 0
+    trainable = _count(temporal) + _count(classifier) + sp_count
     if extra_parts:
         for _tag, mod in extra_parts:
             trainable += _count(mod) if mod is not None else 0
 
     print(f"  Frozen (encoder):     {frozen / 1e6:.1f}M")
     print(f"  Trainable (temporal): {_count(temporal) / 1e6:.2f}M")
-    print(f"  Trainable (classifier+proj): {_count(classifier) / 1e6:.2f}M")
+    cls_label = f"  Trainable (classifier+proj{'+spatial_pool' if sp_count else ''}): {(_count(classifier) + sp_count) / 1e6:.2f}M"
+    print(cls_label)
     if extra_parts:
         for tag, mod in extra_parts:
             n = _count(mod) if mod is not None else 0
@@ -704,19 +706,15 @@ class ClsVJEPA(nn.Module):
             self._grid_size = vjepa_spatial_grid[0] * vjepa_spatial_grid[1]
             n_spat = img_size // patch_size
 
-            # Learned spatial downsampling: a depthwise Conv3d that learns
-            # to extract spatially-distinct features from each grid region.
-            # AdaptiveAvgPool3d produced nearly identical grid cells (cos-sim
-            # > 0.97) because V-JEPA patch tokens are spatially smooth.
-            # Depthwise conv preserves per-channel spatial structure and lets
-            # the model learn which spatial variations matter — the same role
-            # that hierarchical self-attention plays in Swin.
-            self.vjepa_spatial_pool = nn.Conv3d(
+            # Learned spatial downsampling via depthwise Conv2d.  The temporal
+            # dimension is always 1 (averaged upstream in encode_video_clips /
+            # _spatial_pool_tokens), so 3D convolution is unnecessary.
+            self.vjepa_spatial_pool = nn.Conv2d(
                 embed_dim, embed_dim,
-                kernel_size=(1, n_spat // vjepa_spatial_grid[0],
-                                n_spat // vjepa_spatial_grid[1]),
-                stride=(1, n_spat // vjepa_spatial_grid[0],
-                           n_spat // vjepa_spatial_grid[1]),
+                kernel_size=(n_spat // vjepa_spatial_grid[0],
+                             n_spat // vjepa_spatial_grid[1]),
+                stride=(n_spat // vjepa_spatial_grid[0],
+                        n_spat // vjepa_spatial_grid[1]),
                 groups=embed_dim,   # depthwise: each channel learns its own filter
                 bias=False,
             )
@@ -729,7 +727,7 @@ class ClsVJEPA(nn.Module):
                     f"{self._vjepa_n_temp}×{n_spat}×{n_spat}"
                     f" → 1×{vjepa_spatial_grid[0]}×{vjepa_spatial_grid[1]}"
                     f" = {self._grid_size} grid cells × {embed_dim}D"
-                    f"  (Conv3d k=1×{k_h}×{k_w}, groups={embed_dim})"
+                    f"  (Conv2d k={k_h}×{k_w}, groups={embed_dim})"
                 )
 
         # ---- Slot-based path ------------------------------------------------
@@ -768,8 +766,9 @@ class ClsVJEPA(nn.Module):
 
             mode = "sparse" if is_sparse else "dense"
             if verbose:
+                sp = getattr(self, "vjepa_spatial_pool", None)
                 print(f"\n[ClsVJEPA] SlotSSM ({mode}) — Parameter summary:")
-                _print_param_summary(encoder, self.temporal, self.classifier)
+                _print_param_summary(encoder, self.temporal, self.classifier, spatial_pool=sp)
             return
 
         # ---- Standard path --------------------------------------------------
@@ -808,10 +807,12 @@ class ClsVJEPA(nn.Module):
         self.encoder = encoder   # attach AFTER weight init — preserves pretrained weights
 
         if verbose:
+            sp = getattr(self, "vjepa_spatial_pool", None)
             print("\n[ClsVJEPA] Parameter summary:")
             _print_param_summary(
                 encoder, self.temporal,
                 nn.ModuleList([self.lin1, self.lin2, self.lin3, self.bn]),
+                spatial_pool=sp,
             )
 
     def encode_video_clips(
@@ -821,7 +822,10 @@ class ClsVJEPA(nn.Module):
 
         Processes all clips at once in mega-batch, splitted in chunks of ``max_clips_per_batch`` to bound GPU memory.
 
-        Returns ``[B, n_clips, N_patches, embed_dim]`` where ``n_clips = T - num_frames``.
+        Temporally averages the patch tokens before returning (lossless for
+        spatial-grid heads — the depthwise Conv2d is linear).
+
+        Returns ``[B, n_clips, S_patches, embed_dim]`` where ``n_clips = T - num_frames``.
         """
         B, _, T, _, _ = x.shape
         n_clips = T - num_frames
@@ -851,7 +855,13 @@ class ClsVJEPA(nn.Module):
             p = p.view(csz, B, N_patches, -1).transpose(0, 1)  # [B, csz, N_patches, D]
             chunks_out.append(p)
 
-        return torch.cat(chunks_out, dim=1).contiguous()        # [B, n_clips, N_patches, D]
+        result = torch.cat(chunks_out, dim=1).contiguous()        # [B, n_clips, T·S, D]
+        # Temporal average — lossless since the downstream Conv2d is linear
+        # (mean(Conv2d(x_t)) = Conv2d(mean(x_t))).
+        T_patches = num_frames // self._tubelet_size
+        S_patches = result.shape[2] // T_patches
+        result = result.reshape(B, n_clips, T_patches, S_patches, result.shape[3]).mean(dim=2)
+        return result                                                # [B, n_clips, S, D]
 
     @property
     def _needs_patches(self) -> bool:
@@ -868,30 +878,34 @@ class ClsVJEPA(nn.Module):
     def _spatial_pool_tokens(
         self, x: torch.Tensor, n_temp: int | None = None,
     ) -> torch.Tensor:
-        """Reshape patch tokens → spatial grid → learned Conv3d → tokens.
+        """Reshape patch tokens → temporal average → spatial grid → learned Conv2d → tokens.
+
+        Temporal averaging is done *before* the learned depthwise Conv2d.
+        Since convolution is linear,
+        :math:`\\text{mean}(\\text{conv}(x_t)) = \\text{conv}(\\text{mean}(x_t))`
+        — the two operations commute, so averaging early is lossless and
+        shrinks the Conv2d input by :math:`T\\times`.
 
         ``[B, N, D]`` → ``[B, grid_size, D]``  (preserves token structure).
         ``n_spat`` is derived from the actual token count so this works with
         any input resolution, not just the config-specified one.
 
-        Uses a learned depthwise Conv3d instead of adaptive average pooling
-        so each grid cell learns to extract spatially-distinct features
-        (adaptive pooling produced near-identical cells from smooth
-        V-JEPA features).
-
         Args:
             x: ``[B, N, D]`` patch tokens from V-JEPA encoder.
-            n_temp: Temporal patches. Defaults to config value
-                (``num_frames // tubelet_size``).
+            n_temp: Temporal patches.  Defaults to 1 (input is already
+                temporally averaged, e.g. from ``encode_video_clips`` or
+                precomputed .pt files).  Callers that pass raw encoder
+                output (``forward()``) should pass ``self._vjepa_n_temp``
+                explicitly.
         """
         B, N, D = x.shape
-        t = n_temp if n_temp is not None else self._vjepa_n_temp
+        t = n_temp if n_temp is not None else 1
         h = int((N / t) ** 0.5)
-        x = x.reshape(B, t, h, h, D)
-        x = x.permute(0, 4, 1, 2, 3)                       # [B, D, T, H, W]
-        x = self.vjepa_spatial_pool(x)                       # [B, D, T, h, w]  (learned spatial)
-        x = x.mean(dim=2)                                    # [B, D, h, w]     (avg temporally)
-        x = x.flatten(2).transpose(1, 2)                     # [B, grid_size, D]
+        # Temporal average (lossless — see docstring), then feed as NCHW to Conv2d.
+        x = x.reshape(B, t, h, h, D).mean(dim=1)                # [B, H, W, D]
+        x = x.permute(0, 3, 1, 2)                                # [B, D, H, W]
+        x = self.vjepa_spatial_pool(x)                            # [B, D, h, w]  (learned spatial)
+        x = x.flatten(2).transpose(1, 2)                         # [B, grid_size, D]
         return x
 
     def forward_temporal_step(
@@ -938,8 +952,7 @@ class ClsVJEPA(nn.Module):
         if self._slot_based:
             patches = self.encoder(x, return_patches=True)    # [B, N, embed_dim]
             if self._use_spatial_grid:
-                n_temp = x.shape[2] // self._tubelet_size
-                patches = self._spatial_pool_tokens(patches, n_temp)
+                patches = self._spatial_pool_tokens(patches, self._vjepa_n_temp)
             slots, new_state = self.temporal(patches, state)  # [B, K, D]
             # Learned attention-pool: query attends to slots
             D = slots.shape[-1]
@@ -949,9 +962,8 @@ class ClsVJEPA(nn.Module):
             return self.classifier(pooled), new_state
 
         if self._keep_patches:
-            n_temp = x.shape[2] // self._tubelet_size
             x = self.encoder(x, return_patches=True)           # [B, N, D]
-            x = self._spatial_pool_tokens(x, n_temp).reshape(x.shape[0], -1)
+            x = self._spatial_pool_tokens(x, self._vjepa_n_temp).reshape(x.shape[0], -1)
         elif self._is_swin:
             x = self.encoder(x, return_patches=True)           # [B, 36, embed_dim]
             x = x.flatten(1)                                   # [B, 36*C]

@@ -97,6 +97,9 @@ def main():
     model.eval()
     fb = cfg.NF
 
+    # encode_video_clips temporally averages internally — lossless since the
+    # downstream Conv2d is linear and mean(conv(x_t)) = conv(mean(x_t)).
+
     # --- Validation dataset ------------------------------------------------
     # Precomputation encodes one full video at a time — batch_size=1 is
     # required because each video is saved to its own .pt file and the loop
@@ -119,7 +122,10 @@ def main():
         v_len = video_data.shape[2]
 
         with torch.no_grad():
-            patches = model.encode_video_clips(video_data, fb)
+            patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, S, D]  (temporally averaged)
+
+        S_patches = patches.shape[2]  # spatial patches (T already averaged out by encode_video_clips)
+        # patches shape: [1, n_clips, S_patches, D]
 
         # Expected dimensions (encoder-agnostic — derived from actual output)
         expected_D = model.encoder.embed_dim
@@ -128,17 +134,20 @@ def main():
         print(f"  Video key:               {video_key}")
         print(f"  Video frames (T):       {v_len}")
         print(f"  num_frames (fb):        {cfg.num_frames}")
+        print(f"  tubelet_size:           {cfg.get('tubelet_size', 2)}")
         print(f"  Expected n_clips:       {expected_clips}")
-        print(f"  Actual N_patches:       {patches.shape[2]}")
+        print(f"  S_patches (spatial):    {S_patches}")
         print(f"  Expected embed_dim:     {expected_D}")
         print(f"  patches_full.shape:     {list(patches.shape)}")
         print(f"  data_info.shape:        {list(data_info.shape)}")
 
         # Validate
-        assert patches.ndim == 4, f"patches should be 4D [B,clips,N,D], got {patches.ndim}D"
+        assert patches.ndim == 4, f"patches should be 4D [B,clips,S,D], got {patches.ndim}D"
         assert patches.shape[0] == 1, f"batch dim should be 1, got {patches.shape[0]}"
         assert patches.shape[1] == expected_clips, \
             f"n_clips mismatch: got {patches.shape[1]}, expected {expected_clips}"
+        assert patches.shape[2] == S_patches, \
+            f"S_patches mismatch: got {patches.shape[2]}, expected {S_patches}"
         assert patches.shape[3] == expected_D, \
             f"embed_dim mismatch: got {patches.shape[3]}, expected {expected_D}"
         assert data_info.shape == (1, 11), \
@@ -157,13 +166,13 @@ def main():
 
         print(f"\n  Saved & reloaded from: {verify_path}")
         print(f"  loaded[patches_full].shape: {list(loaded['patches_full'].shape)}")
-        stored_N = patches.shape[2]  # actual N from the saved data
+        stored_S = patches.shape[2]  # spatial patches only
         print(f"  loaded[patches_full].dtype: {loaded['patches_full'].dtype}")
         print(f"  loaded[data_info].shape:    {list(loaded['data_info'].shape)}")
         print(f"  loaded[data_info].dtype:    {loaded['data_info'].dtype}")
         print(f"  loaded[v_len]:              {loaded['v_len']}")
 
-        assert list(loaded["patches_full"].shape) == [expected_clips, stored_N, expected_D], \
+        assert list(loaded["patches_full"].shape) == [expected_clips, stored_S, expected_D], \
             f"Loaded shape mismatch: {list(loaded['patches_full'].shape)}"
         assert loaded["patches_full"].dtype == torch.float16, "Saved patches should be float16"
         assert list(loaded["data_info"].shape) == [11]
@@ -190,11 +199,11 @@ def main():
         video_data = torch.swapaxes(video_data, 1, 2)  # [1, C, T, H, W]
 
         with torch.no_grad(), amp_ctx:
-            patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, N, D]
+            patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, S, D]  (temporally averaged)
 
         # Move to CPU immediately and free GPU tensors — full-video
         v_len = video_data.shape[2]  # capture before del
-        patches_cpu = patches[0].cpu().half()          # [n_clips, N, D]  fp16
+        patches_cpu = patches[0].cpu().half()          # [n_clips, S, D]  fp16
         info_cpu = data_info[0].cpu()                  # [11]  fp32
         del patches, video_data, data_info
         torch.cuda.empty_cache()

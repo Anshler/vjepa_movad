@@ -76,7 +76,7 @@ model.to(DEVICE)
 model.train()
 
 # --- Synthetic data ---
-B = 4
+B = 2
 vd = torch.randn(B, 3, VCL, img_size, img_size, device=DEVICE)
 di = torch.zeros(B, 11, device=DEVICE)
 di[:, 0] = VCL
