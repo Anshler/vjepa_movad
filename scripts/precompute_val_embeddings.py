@@ -52,8 +52,10 @@ def parse_args():
                         help="Device override (default: cuda if available)")
     parser.add_argument("--verify", action="store_true",
                         help="Only encode 1 video, save it, and verify the output shape")
-    parser.add_argument("--amp", default="fp16", choices=["fp32", "fp16", "bf16"],
-                        help="AMP dtype for encoder pass (default: fp16)")
+    parser.add_argument("--amp", default=None, choices=["fp32", "fp16", "bf16"],
+                        help="AMP dtype for encoder pass (default: from config, or fp16)")
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help="Batch size for encoding (default: 4)")
     return parser.parse_args()
 
 
@@ -101,15 +103,19 @@ def main():
     # downstream Conv2d is linear and mean(conv(x_t)) = conv(mean(x_t)).
 
     # --- Validation dataset ------------------------------------------------
-    # Precomputation encodes one full video at a time — batch_size=1 is
-    # required because each video is saved to its own .pt file and the loop
-    # indexes val_dataset.keys by iteration order.
-    cfg.batch_size = 1
+    cfg.batch_size = args.batch_size
     _, val_loader = setup_dota(
         Dota, cfg, num_workers=cfg.get("num_workers", 4),
         VCL=None, phase="test",
     )
     val_dataset = val_loader.dataset
+
+    # --- AMP ---------------------------------------------------------------
+    amp = args.amp or cfg.get("amp", "fp16")
+    _AMP_DTYPE = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+    amp_dtype = _AMP_DTYPE[amp]
+    amp_ctx = (torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype
+               else __import__("contextlib").nullcontext())
 
     # --- Verify mode: encode 1 video, save, and validate shapes ------------
     if args.verify:
@@ -121,7 +127,7 @@ def main():
         video_data = torch.swapaxes(video_data, 1, 2)
         v_len = video_data.shape[2]
 
-        with torch.no_grad():
+        with torch.no_grad(), amp_ctx:
             patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, S, D]  (temporally averaged)
 
         S_patches = patches.shape[2]  # spatial patches (T already averaged out by encode_video_clips)
@@ -140,6 +146,7 @@ def main():
         print(f"  Expected embed_dim:     {expected_D}")
         print(f"  patches_full.shape:     {list(patches.shape)}")
         print(f"  data_info.shape:        {list(data_info.shape)}")
+        print(f"  save_dtype:             float32 (full encoder output)")
 
         # Validate
         assert patches.ndim == 4, f"patches should be 4D [B,clips,S,D], got {patches.ndim}D"
@@ -156,7 +163,7 @@ def main():
 
         # Save to disk and reload to verify disk format
         save_dict = {
-            "patches_full": patches[0].cpu().half(),
+            "patches_full": patches[0].cpu(),
             "data_info": data_info[0].cpu(),
             "v_len": int(v_len),
         }
@@ -174,7 +181,8 @@ def main():
 
         assert list(loaded["patches_full"].shape) == [expected_clips, stored_S, expected_D], \
             f"Loaded shape mismatch: {list(loaded['patches_full'].shape)}"
-        assert loaded["patches_full"].dtype == torch.float16, "Saved patches should be float16"
+        assert loaded["patches_full"].dtype == torch.float32, \
+            f"Saved patches should be float32, got {loaded['patches_full'].dtype}"
         assert list(loaded["data_info"].shape) == [11]
         assert loaded["v_len"] == v_len
 
@@ -182,40 +190,39 @@ def main():
         return
 
     # --- Encode & save -----------------------------------------------------
-    # Accumulate in memory and flush to disk in chunks — per-video torch.save
-    # on a network/WSL mount can bottleneck the whole pipeline.
-    _AMP_DTYPE = {"fp32": None, "fp16": torch.float16, "bf16": torch.bfloat16}
-    amp_dtype = _AMP_DTYPE[args.amp]
-    amp_ctx = (torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype
-               else __import__("contextlib").nullcontext())
 
-    print(f"Encoding {len(val_dataset)} videos → {embed_dir}  (AMP: {args.amp})")
+    print(f"Encoding {len(val_dataset)} videos → {embed_dir}  (AMP: {amp}, batch_size: {args.batch_size})")
     global_idx = 0
 
     for video_data, data_info in tqdm(val_loader, desc="Encoding val"):
-        video_key = val_dataset.keys[global_idx]
+        B = video_data.shape[0]
         video_data = video_data.to(cfg.device, non_blocking=True)
         data_info = data_info.to(cfg.device, non_blocking=True)
-        video_data = torch.swapaxes(video_data, 1, 2)  # [1, C, T, H, W]
+        video_data = torch.swapaxes(video_data, 1, 2)  # [B, C, T, H, W]
 
         with torch.no_grad(), amp_ctx:
-            patches = model.encode_video_clips(video_data, fb)  # [1, n_clips, S, D]  (temporally averaged)
+            patches = model.encode_video_clips(video_data, fb)  # [B, n_clips, S, D]  (temporally averaged)
 
-        # Move to CPU immediately and free GPU tensors — full-video
-        v_len = video_data.shape[2]  # capture before del
-        patches_cpu = patches[0].cpu().half()          # [n_clips, S, D]  fp16
-        info_cpu = data_info[0].cpu()                  # [11]  fp32
+        # Per-video original frame counts (data_info[:, 0]) — pad_collate_videos
+        # pads to the batch max, so video_data.shape[2] is identical for all items.
+        v_len_orig = data_info[:, 0].long()  # [B]
+
+        for b in range(B):
+            v_len_b = int(v_len_orig[b].item())
+            n_clips_valid = v_len_b - fb  # discard clips from padded frames
+            video_key = val_dataset.keys[global_idx + b]
+            save_dict = {
+                "patches_full": patches[b, :n_clips_valid].cpu(),
+                "data_info": data_info[b].cpu(),                          # [11]  fp32
+                "v_len": v_len_b,
+            }
+            out_path = os.path.join(embed_dir, f"{video_key}.pt")
+            torch.save(save_dict, out_path)
+
         del patches, video_data, data_info
-        torch.cuda.empty_cache()
-
-        save_dict = {
-            "patches_full": patches_cpu,
-            "data_info": info_cpu,
-            "v_len": int(v_len),
-        }
-        out_path = os.path.join(embed_dir, f"{video_key}.pt")
-        torch.save(save_dict, out_path)
-        global_idx += 1
+        if B > 1:
+            torch.cuda.empty_cache()
+        global_idx += B
 
     print(f"Done — {global_idx} embeddings saved to {embed_dir}")
 

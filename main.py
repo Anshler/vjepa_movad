@@ -67,21 +67,17 @@ def pad_collate_embeddings(batch):
     """Collate precomputed embeddings — pad ``patches_full`` to max clips.
 
     Each sample is a dict with:
-        ``patches_full`` — ``[n_clips_i, N, D]``  (fp16)
-        ``data_info``   — ``[11]``                (fp32)
+        ``patches_full`` — ``[n_clips_i, N, D]``  (fp32)
+        ``data_info``   — ``[11]``               (fp32)
         ``v_len``       — int
 
     Returns a dict with tensors stacked into ``[B, ...]``.
-
-    IMPORTANT: The padded tensor stays in fp16 to keep CPU→GPU transfer
-    memory in check.  ``patches.mean(dim=2)`` and the temporal model's
-    LayerNorm+Mamba blocks handle fp16 input without issues.
     """
     max_clips = max(b["patches_full"].shape[0] for b in batch)
     N = batch[0]["patches_full"].shape[1]
     D = batch[0]["patches_full"].shape[2]
     B = len(batch)
-    padded = torch.zeros(B, max_clips, N, D, dtype=torch.float16)
+    padded = torch.zeros(B, max_clips, N, D, dtype=torch.float32)
     data_infos = torch.zeros(B, 11)
     v_lens = torch.zeros(B, dtype=torch.long)
     for i, item in enumerate(batch):
@@ -102,7 +98,7 @@ class PrecomputedValDataset(torch.utils.data.Dataset):
     block without allocator fragmentation.
 
     Each ``.pt`` file is a dict with keys:
-        ``patches_full`` — fp16 ``[n_clips, N_patches, embed_dim]``
+        ``patches_full`` — fp32 ``[n_clips, N_patches, embed_dim]``
         ``data_info``   — fp32 ``[11]``  (same format as raw DoTA)
         ``v_len``       — int, total video frames
     """
