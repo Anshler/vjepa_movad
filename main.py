@@ -211,7 +211,7 @@ def parse_configs():
     _yaml_ckpt = cfg.get("checkpoint_path", None)
     _yaml_data = cfg.get("data_path", "./data/dota")
     _yaml_vcl = cfg.get("VCL", 16)
-    _yaml_nf = cfg.get("num_frames", 16)
+    _yaml_nf = cfg.get("num_frames", cfg.get("NF", 16))
     _yaml_batch = cfg.get("batch_size", 8)
     _yaml_lr = cfg.get("lr", 0.0001)
 
@@ -240,12 +240,19 @@ def parse_configs():
     if args.num_frames is None:
         cfg.num_frames = _yaml_nf
 
+    # NF and num_frames are the same thing — keep them in sync
+    cfg.NF = cfg.num_frames
+
     cfg.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Build head configs — always, even for 1 head
     import pathlib
 
-    cfg._head_names = [f"{pathlib.Path(p).stem}_VCL_{cfg.VCL}" for p in args.config]
+    encoder_status = "finetuned" if cfg.get("train_encoder", False) else "frozen"
+    cfg._head_names = [
+        f"{pathlib.Path(p).stem}_VCL_{cfg.VCL}_NF_{cfg.NF}_{encoder_status}"
+        for p in args.config
+    ]
     head_cfgs_flat = []
     for name, hc in zip(cfg._head_names, all_cfgs):
         entry = dict(hc)
@@ -778,13 +785,7 @@ if __name__ == "__main__":
     cfg = parse_configs()
     set_deterministic(cfg.seed)
 
-    # Derive NF from num_frames so they can't drift apart.
-    if "NF" not in cfg:
-        cfg.NF = cfg.num_frames
-    # If the user overrode num_frames via CLI, keep NF in sync
-    if cfg.num_frames != cfg.NF:
-        print(f"  NF synced: {cfg.NF} → {cfg.num_frames} (from --num_frames)")
-        cfg.NF = cfg.num_frames
+    # NF already synced to num_frames in parse_configs
 
     # --- Data --------------------------------------------------------------
     if cfg.phase == "train":
