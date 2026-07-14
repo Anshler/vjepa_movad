@@ -416,6 +416,10 @@ def train(cfg, model, traindata_loader, begin_epoch,
                     # Encode this single clip — independent graph per frame
                     clip = patches_or_video[:, :, i - fb:i, :, :]
                     feat = head.encoder(clip, return_patches=True)
+                    # Temporal average: mean(conv(x_t)) = conv(mean(x_t)),
+                    # lossless since the downstream spatial pool is linear.
+                    # Mirrors encode_video_clips' temporal mean.
+                    feat = feat.reshape(feat.shape[0], head._vjepa_n_temp, -1, feat.shape[-1]).mean(dim=1)
                     if not head._needs_patches:
                         feat = feat.mean(dim=1)
                 else:
