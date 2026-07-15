@@ -27,7 +27,7 @@ from movad_core.losses import build_loss
 from movad_core.optim import build_optimizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="cfgs/vjepa_mamba.yaml",
+parser.add_argument("--config", default="cfgs/swin_mamba.yaml",
                     help="Path to config YAML (e.g. cfgs/swin_lstm.yaml or cfgs/vjepa_v1.yaml)")
 parser.add_argument("--checkpoint", default=None,
                     help="Override checkpoint path (uses config value if not set)")
@@ -96,6 +96,13 @@ print(f"Trainable params in head: {n_params:,}")
 # --- Feature diversity check ---
 MAX_PAIRWISE = 2000  # cap tokens to avoid O(N²×D) broadcast OOM
 
+# ViT encoder returns [B, T·S, D] raw tokens; temporal average mirrors
+# encode_video_clips.  Swin skips this — it processes the full sequence.
+def _temporal_avg(feat):
+    if head._is_swin:
+        return feat
+    return feat.reshape(feat.shape[0], head._vjepa_n_temp, -1, feat.shape[-1]).mean(dim=1)
+
 def _sim_report(t, label):
     """Print pairwise cosine similarity stats for a set of vectors.
     Caps at MAX_PAIRWISE tokens (random subset) to stay within GPU memory."""
@@ -123,6 +130,7 @@ def _sim_report(t, label):
 with torch.no_grad():
     if args.train_encoder:
         patches_check = head.encoder(vd[:, :, :NF, :, :], return_patches=True)
+        patches_check = _temporal_avg(patches_check)  # [B, T·S, D] → [B, S, D] (ViT only)
         # patches_check: [B, N_patches, embed_dim]
         _sim_report(patches_check, "patch tokens")
         _sim_report(patches_check.mean(dim=1, keepdim=True), "pooled (mean)")
@@ -169,6 +177,7 @@ for epoch in range(args.epochs):
         if args.train_encoder:
             clip = vd[:, :, i - NF:i, :, :]
             feat = head.encoder(clip, return_patches=True)
+            feat = _temporal_avg(feat)  # [B, T·S, D] → [B, S, D] (ViT only)
             if not head._needs_patches:
                 feat = feat.mean(dim=1)
         else:
@@ -205,6 +214,7 @@ for epoch in range(args.epochs):
                 if args.train_encoder:
                     clip = vd[:, :, i - NF:i, :, :]
                     feat = head.encoder(clip, return_patches=True)
+                    feat = _temporal_avg(feat)  # [B, T·S, D] → [B, S, D] (ViT only)
                     if not head._needs_patches:
                         feat = feat.mean(dim=1)
                 else:

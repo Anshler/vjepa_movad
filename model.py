@@ -854,12 +854,14 @@ class ClsVJEPA(nn.Module):
             chunks_out.append(p)
 
         result = torch.cat(chunks_out, dim=1).contiguous()        # [B, n_clips, T·S, D]
-        # Temporal average — lossless since the downstream Conv2d is linear
-        # (mean(Conv2d(x_t)) = Conv2d(mean(x_t))).
-        T_patches = num_frames // self._tubelet_size
-        S_patches = result.shape[2] // T_patches
-        result = result.reshape(B, n_clips, T_patches, S_patches, result.shape[3]).mean(dim=2)
-        return result                                                # [B, n_clips, S, D]
+        if not self._is_swin:
+            # Temporal average — lossless since the downstream Conv2d is linear
+            # (mean(Conv2d(x_t)) = Conv2d(mean(x_t))).
+            # Swin skips this — it processes the full T×S token sequence.
+            T_patches = num_frames // self._tubelet_size
+            S_patches = result.shape[2] // T_patches
+            result = result.reshape(B, n_clips, T_patches, S_patches, result.shape[3]).mean(dim=2)
+        return result                                                # [B, n_clips, S, D]  (or T·S for Swin)
 
     @property
     def _needs_patches(self) -> bool:
