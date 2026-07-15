@@ -693,16 +693,14 @@ class ClsVJEPA(nn.Module):
         # V-JEPA spatial-grid mode: keep patch tokens, pool spatially (like Swin).
         # Applies to ALL temporal models — it's an encoder-postprocessing step.
         # e.g. vjepa_spatial_grid=[6, 6] pools 24×24×2 → 6×6×1 = 36 grid cells.
+        self._tubelet_size = tubelet_size
+        self._vjepa_n_temp = num_frames // tubelet_size
+
         self._use_spatial_grid = (
             vjepa_spatial_grid is not None
             and not self._is_swin
         )
         if self._use_spatial_grid:
-            self._tubelet_size = tubelet_size
-            # Config default for forward_temporal_step (features pre-encoded
-            # at config num_frames & img_size).  forward() computes n_temp
-            # from the actual input tensor.
-            self._vjepa_n_temp = num_frames // tubelet_size
             self._grid_size = vjepa_spatial_grid[0] * vjepa_spatial_grid[1]
             n_spat = img_size // patch_size
 
