@@ -17,6 +17,7 @@ checkpoint_path: null
 checkpoint_key: ema_encoder
 vjepa_spatial_grid: [6, 6]
 pool: mean                          # ignored — SlotSSM uses full patch tokens
+compile: false
 
 # --- Temporal model -------------------------------------------------------
 temporal_model: slotssm

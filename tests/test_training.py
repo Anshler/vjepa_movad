@@ -4,8 +4,7 @@ Supports all configs (ViT, Swin, LSTM, Mamba, SlotSSM variants).
 
 Verifies:
   - Model build from config
-  - encode_video_clips with autocast (train + val)
-  - Per-frame temporal loop with autocast (train + val)
+  - Per-clip full forward with autocast (train + val)
   - Loss compute, backward, optimizer step (no NaNs, loss decreases)
   - Swin-specific architecture checks (grid cells, projection sizes)
 
@@ -103,7 +102,6 @@ is_vit = not is_swin and not args.config.startswith("swin")
 
 # --- Architecture diagnostics (Swin-specific + general) ---
 print(f"\nArchitecture: {'Swin' if is_swin else 'ViT'} backbone  |  temporal: {head.temporal_type}")
-print(f"  _needs_patches: {head._needs_patches}")
 if is_swin:
     embed_dim = head.encoder.embed_dim
     num_patches = head.encoder.num_patches
@@ -184,16 +182,7 @@ print("\n" + "=" * 70)
 print("1. TRAINING — one step")
 print("=" * 70)
 
-train_enc = args.train_encoder
-if not train_enc:
-    with autocast_ctx[head_name]:
-        patches = model.encode_video_clips(video_data, NF)
-    print(f"  patches: {tuple(patches.shape)}  dtype={patches.dtype}")
-    if is_swin:
-        assert patches.shape[2] == head.encoder.num_patches, \
-            f"Swin: expected {head.encoder.num_patches} grid cells, got {patches.shape[2]}"
-        print(f"  ✓ Swin patches: {patches.shape[2]} grid cells × {patches.shape[3]} channels")
-    patches_in = patches if head._needs_patches else patches.mean(dim=2)
+print(f"  synthetic video: {tuple(video_data.shape)}")
 
 toa_batch = data_info[:, 2]
 tea_batch = data_info[:, 3]
@@ -207,15 +196,8 @@ for i in range(NF, v_len):
     target = gt_cls_target(i, toa_batch, tea_batch).long()
 
     with autocast_ctx[head_name]:
-        if train_enc:
-            clip = video_data[:, :, i - NF:i, :, :]
-            feat = head.encoder(clip, return_patches=True)
-            if not head._needs_patches:
-                feat = feat.mean(dim=1)
-        else:
-            feat = patches_in[:, i - NF, ...]
-
-        output, state = head.forward_temporal_step(feat, state)
+        clip = video_data[:, :, i - NF:i, :, :]   # [B, C, NF, H, W]
+        output, state = head(clip, state)           # full forward: encoder → temporal → classifier
 
     flt = i >= video_len_orig
     target[flt] = -100
@@ -246,11 +228,6 @@ print("\n" + "=" * 70)
 print("2. TRAINING — second step (check loss decreases)")
 print("=" * 70)
 
-if not train_enc:
-    with autocast_ctx[head_name]:
-        patches2 = model.encode_video_clips(video_data, NF)
-    patches_in2 = patches2 if head._needs_patches else patches2.mean(dim=2)
-
 state2 = None
 total_loss2_val = 0.0
 
@@ -258,15 +235,8 @@ for i in range(NF, v_len):
     target = gt_cls_target(i, toa_batch, tea_batch).long()
 
     with autocast_ctx[head_name]:
-        if train_enc:
-            clip = video_data[:, :, i - NF:i, :, :]
-            feat = head.encoder(clip, return_patches=True)
-            if not head._needs_patches:
-                feat = feat.mean(dim=1)
-        else:
-            feat = patches_in2[:, i - NF, ...]
-
-        output, state2 = head.forward_temporal_step(feat, state2)
+        clip = video_data[:, :, i - NF:i, :, :]
+        output, state2 = head(clip, state2)
 
     flt = i >= video_len_orig
     target[flt] = -100
@@ -307,19 +277,13 @@ data_info_val[:, 3] = v_len_val - 6
 data_info_val[:, 4] = 1
 
 with torch.no_grad():
-    with autocast_ctx[head_name]:
-        patches_val = model.encode_video_clips(video_val, NF)
-    print(f"  val patches: {tuple(patches_val.shape)}  dtype={patches_val.dtype}")
-
     n_clips = v_len_val - NF
-    patches_in_val = patches_val if head._needs_patches else patches_val.mean(dim=2)
-
     state_val = None
     outputs_val = torch.zeros(1, n_clips, device=DEVICE)
     for i in range(NF, v_len_val):
-        feat = patches_in_val[:, i - NF, ...].float()
+        clip = video_val[:, :, i - NF:i, :, :]
         with autocast_ctx[head_name]:
-            output, state_val = head.forward_temporal_step(feat, state_val)
+            output, state_val = head(clip, state_val)
         if head_cfgs[head_name].get("apply_softmax", False):
             output = output.softmax(dim=1)
         outputs_val[:, i - NF] = output[:, 1]

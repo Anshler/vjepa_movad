@@ -705,8 +705,8 @@ class ClsVJEPA(nn.Module):
             n_spat = img_size // patch_size
 
             # Learned spatial downsampling via depthwise Conv2d.  The temporal
-            # dimension is always 1 (averaged upstream in encode_video_clips /
-            # _spatial_pool_tokens), so 3D convolution is unnecessary.
+            # dimension is always 1 (averaged upstream in _spatial_pool_tokens),
+            # so 3D convolution is unnecessary.
             self.vjepa_spatial_pool = nn.Conv2d(
                 embed_dim, embed_dim,
                 kernel_size=(n_spat // vjepa_spatial_grid[0],
@@ -813,68 +813,6 @@ class ClsVJEPA(nn.Module):
                 spatial_pool=sp,
             )
 
-    def encode_video_clips(
-        self, x: torch.Tensor, num_frames: int, max_clips_per_batch: int = 32,
-    ) -> torch.Tensor:
-        """Run the encoder over every NF-frame sliding window in one batch of videos.
-
-        Processes all clips at once in mega-batch, splitted in chunks of ``max_clips_per_batch`` to bound GPU memory.
-
-        Temporally averages the patch tokens before returning (lossless for
-        spatial-grid heads — the depthwise Conv2d is linear).
-
-        Returns ``[B, n_clips, S_patches, embed_dim]`` where ``n_clips = T - num_frames``.
-        """
-        B, _, T, _, _ = x.shape
-        n_clips = T - num_frames
-
-        # Stack all clips into one mega-batch in a single encoder pass for higher throughput.
-        # all_clips[i] = x[:, :, i:i+NF, ...]  →  [B, C, NF, H, W]
-        # torch.cat(dim=0) produces clip-major ordering:
-        #   [v0_c0, v1_c0, ..., v_{B-1}_c0, v0_c1, v1_c1, ..., v_{B-1}_cN]
-        # After encoding, view(csz, B, N, D).transpose(0,1) recovers:
-        #   [B, csz, N_patches, D]  — where out[b, c] = video b's clip c.
-        #
-        # During training VCL keeps n_clips small (e.g. 4–12), so a single
-        # chunk handles everything.  Chunking only activates for full-video
-        # encoding (precompute / eval) where n_clips can reach hundreds.
-        all_clips = [x[:, :, i - num_frames:i, :, :] for i in range(num_frames, T)]
-        ctx = torch.no_grad() if not self.train_encoder else torch.enable_grad()
-        chunks_out = []
-        for start in range(0, n_clips, max_clips_per_batch):
-            end = min(start + max_clips_per_batch, n_clips)
-            chunk = torch.cat(all_clips[start:end], dim=0)    # [csz * B, C, NF, H, W]
-
-            with ctx:
-                p = self.encoder(chunk, return_patches=True)   # [csz * B, N_patches, D]
-
-            csz = end - start
-            N_patches = p.shape[1]
-            p = p.view(csz, B, N_patches, -1).transpose(0, 1)  # [B, csz, N_patches, D]
-            chunks_out.append(p)
-
-        result = torch.cat(chunks_out, dim=1).contiguous()        # [B, n_clips, T·S, D]
-        if not self._is_swin:
-            # Temporal average — lossless since the downstream Conv2d is linear
-            # (mean(Conv2d(x_t)) = Conv2d(mean(x_t))).
-            # Swin skips this — it processes the full T×S token sequence.
-            T_patches = num_frames // self._tubelet_size
-            S_patches = result.shape[2] // T_patches
-            result = result.reshape(B, n_clips, T_patches, S_patches, result.shape[3]).mean(dim=2)
-        return result                                                # [B, n_clips, S, D]  (or T·S for Swin)
-
-    @property
-    def _needs_patches(self) -> bool:
-        """Whether ``forward_temporal_step`` expects full patch/grid tokens.
-
-        Slot-based heads need ``[B, N_patches, embed_dim]`` for
-        cross-attention.  Swin standard heads need ``[B, 36, embed_dim]``
-        for the MOVAD AdaptiveAvgPool3d projection.  V-JEPA spatial-grid
-        heads need ``[B, N_patches, embed_dim]`` for AdaptiveAvgPool3d pooling.
-        ViT standard (mean-pooled) heads return False.
-        """
-        return self._slot_based or self._is_swin or self._keep_patches
-
     def _spatial_pool_tokens(
         self, x: torch.Tensor, n_temp: int | None = None,
     ) -> torch.Tensor:
@@ -893,8 +831,7 @@ class ClsVJEPA(nn.Module):
         Args:
             x: ``[B, N, D]`` patch tokens from V-JEPA encoder.
             n_temp: Temporal patches.  Defaults to 1 (input is already
-                temporally averaged, e.g. from ``encode_video_clips`` or
-                precomputed .pt files).  Callers that pass raw encoder
+                temporally averaged).  Callers that pass raw encoder
                 output (``forward()``) should pass ``self._vjepa_n_temp``
                 explicitly.
         """
@@ -907,46 +844,6 @@ class ClsVJEPA(nn.Module):
         x = self.vjepa_spatial_pool(x)                            # [B, D, h, w]  (learned spatial)
         x = x.flatten(2).transpose(1, 2)                         # [B, grid_size, D]
         return x
-
-    def forward_temporal_step(
-        self, x: torch.Tensor, state: torch.Tensor | tuple | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | tuple | None]:
-        """Single temporal step from pre-computed encoder output.
-
-        Args:
-            x:     For standard ViT path: ``[B, embed_dim]`` (spatially mean-pooled).
-                   For Swin standard path: ``[B, 36, embed_dim]`` (grid cells).
-                   For V-JEPA spatial-grid path: ``[B, N_patches, embed_dim]``.
-                   For slot path: ``[B, N_patches, embed_dim]`` (full patch tokens).
-            state: temporal-model state (MambaCache or LSTM tuple).
-
-        Returns:
-            output:    ``[B, 2]`` class logits.
-            new_state: updated temporal-model state.
-        """
-        if self._slot_based:
-            if self._use_spatial_grid:
-                x = self._spatial_pool_tokens(x)
-            slots, new_state = self.temporal(x, state)
-            D = slots.shape[-1]
-            scores = (slots * self.slot_query).sum(dim=-1) / (D ** 0.5)
-            attn = scores.softmax(dim=-1)
-            pooled = (attn.unsqueeze(-1) * slots).sum(dim=1)
-            return self.classifier(pooled), new_state
-
-        # Standard path: bn → lin1 → relu → temporal → lin2 → relu → lin3
-        if self._keep_patches:
-            x = self._spatial_pool_tokens(x).reshape(x.shape[0], -1)   # [B, grid_size*D]
-        elif self._is_swin:
-            x = x.transpose(1, 2).flatten(1)    # [B, C, 36] → [B, C*36]  (spatial-fast → MOVAD-compatible order)
-        x = self.bn(x)
-        x = F.relu(self.lin1(x))
-        x = self.drop(x)
-        x, new_state = self.temporal(x, state)
-        x = F.relu(self.lin2(x))
-        x = self.drop(x)
-        x = self.lin3(x)
-        return x, new_state
 
     def forward(self, x, state=None):
         if self._slot_based:
@@ -986,10 +883,14 @@ class ClsVJEPA(nn.Module):
 class MultiHeadVJEPA(nn.Module):
     """One V-JEPA encoder → multiple temporal + classifier heads.
 
+    Each head is a complete MOVAD-style model: encoder → projection → temporal
+    → classifier.  Each clip ``[B, C, NF, H, W]`` passes through the full model
+    in a single ``head(clip, state)`` call, matching the original MOVAD pattern
+    exactly — Swin+pool+proj+LSTM+classifier all in one forward.
+
     Each head trains independently (its own optimizer, checkpoint, and
-    TensorBoard writer).  The encoder runs *once* per batch and the resulting
-    patch features are reused by all heads.  Losses are never summed — each
-    head's ``.backward()`` flows only through its own parameters.
+    wandb writer).  Losses are **never summed** — each head's ``.backward()``
+    flows only through its own parameters.
 
     When ``train_encoder=True`` the encoder is unfrozen and trained jointly.
     This mode assumes a **single head** — the encoder gradients come from one
@@ -997,15 +898,11 @@ class MultiHeadVJEPA(nn.Module):
 
     Usage
     -----
-    >>> model = build_multi_head_vjepa(cfg)   # cfg.temporal_heads = [...]
-    >>> patches = model.encode_video_clips(video_data, fb)   # encode once
-    >>>
-    >>> # Train head-by-head
-    >>> for name, head in model.heads.items():
-    >>>     opt = optimizers[name]
-    >>>     opt.zero_grad()
-    >>>     feat = patches if head._needs_patches else patches.mean(dim=2)
-    >>>     loss = run_temporal_loop(head, feat, ...)
+    >>> model = build_multi_head_vjepa(cfg)
+    >>> for i in range(NF, VCL):
+    >>>     clip = video[:, :, i - NF:i, :, :]   # [B, C, NF, H, W]
+    >>>     output, state = model.heads[name](clip, state)
+    >>>     loss = criterion(output, target)
     >>>     loss.backward()
     >>>     opt.step()
     """
@@ -1082,21 +979,6 @@ class MultiHeadVJEPA(nn.Module):
         if not self.train_encoder:
             self.encoder.eval()
         return self
-
-    def encode_video_clips(
-        self, x: torch.Tensor, num_frames: int, max_clips_per_batch: int = 32,
-    ) -> torch.Tensor:
-        """Run the ViT encoder once over all stride-1 clips in one batch.
-
-        Delegates to the first head's :meth:`ClsVJEPA.encode_video_clips`
-        (all heads share the same encoder, so the output is identical).
-        Gradients flow through the encoder when ``train_encoder=True``.
-
-        Returns ``[B, n_clips, N_patches, embed_dim]`` — raw patch/grid tokens.
-        Standard ViT heads call ``.mean(dim=2)`` on this; slot-based and
-        Swin standard heads use the full tensor (checked via ``head._needs_patches``).
-        """
-        return next(iter(self.heads.values())).encode_video_clips(x, num_frames, max_clips_per_batch)
 
 
 # ===========================================================================

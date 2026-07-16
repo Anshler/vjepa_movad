@@ -183,38 +183,19 @@ def _sim_report(t, label):
     print(f"  {label}: tokens={n_label}  sim=[{off.min():.4f}, {off.max():.4f}]  mean={off.mean():.4f}")
 
 with torch.no_grad():
-    if args.train_encoder:
-        patches_check = head.encoder(vd[:, :, :NF, :, :], return_patches=True)
-        patches_check = _temporal_avg(patches_check)
-        _sim_report(patches_check, "patch tokens")
-        _sim_report(patches_check.mean(dim=1, keepdim=True), "pooled (mean)")
-    else:
-        patches_check = model.encode_video_clips(vd, NF)
-        _sim_report(patches_check, "patch tokens (all)")
-        _sim_report(patches_check.mean(dim=2, keepdim=True), "pooled (mean over patches)")
-        if patches_check.shape[2] > 1:
-            single_clip = patches_check[0, 0]
-            _sim_report(single_clip, "patches within ONE clip")
-    feats_flat = patches_check.reshape(-1, patches_check.shape[-1]) if head._needs_patches else patches_check.mean(dim=2).reshape(-1, patches_check.shape[-1])
-    n_feats = feats_flat.shape[0]
-    if n_feats > MAX_PAIRWISE:
-        idx = torch.randperm(n_feats, device=feats_flat.device)[:MAX_PAIRWISE]
-        feats_flat = feats_flat[idx]
-    _sim_report(feats_flat.unsqueeze(0), "features (final)")
+    # Encode first clip to check feature diversity
+    clip_check = vd[:, :, :NF, :, :]
+    patches_check = head.encoder(clip_check, return_patches=True)
+    patches_check = _temporal_avg(patches_check)
+    _sim_report(patches_check, "patch tokens")
+    _sim_report(patches_check.mean(dim=1, keepdim=True), "pooled (mean)")
 
 # --- Overfit ---
+toa_batch = di[:, 2]
+tea_batch = di[:, 3]
+video_len_orig = di[:, 0]
+
 for epoch in range(args.epochs):
-    if args.train_encoder:
-        patches_in = vd
-    else:
-        with torch.no_grad():
-            patches = model.encode_video_clips(vd, NF)
-        patches_in = patches if head._needs_patches else patches.mean(dim=2)
-
-    toa_batch = di[:, 2]
-    tea_batch = di[:, 3]
-    video_len_orig = di[:, 0]
-
     state = None
     epoch_loss = 0.0
     frame_count = 0
@@ -222,16 +203,9 @@ for epoch in range(args.epochs):
     for i in range(NF, VCL):
         target = gt_cls_target(i, toa_batch, tea_batch).long()
 
-        if args.train_encoder:
-            clip = vd[:, :, i - NF:i, :, :]
-            feat = head.encoder(clip, return_patches=True)
-            feat = _temporal_avg(feat)
-            if not head._needs_patches:
-                feat = feat.mean(dim=1)
-        else:
-            feat = patches_in[:, i - NF, ...]
-
-        output, state = head.forward_temporal_step(feat, state)
+        # MOVAD-style: full clip → full model forward in one call
+        clip = vd[:, :, i - NF:i, :, :]          # [B, C, NF, H, W]
+        output, state = head(clip, state)          # encoder → projection → temporal → classifier
 
         flt = i >= video_len_orig
         target[flt] = -100
@@ -253,21 +227,11 @@ for epoch in range(args.epochs):
 
     if epoch == 0 or (epoch + 1) % 10 == 0:
         with torch.no_grad():
-            if not args.train_encoder:
-                patches_p = model.encode_video_clips(vd, NF)
-                patches_in_p = patches_p if head._needs_patches else patches_p.mean(dim=2)
             state_p = None
             preds = []
             for i in range(NF, VCL):
-                if args.train_encoder:
-                    clip = vd[:, :, i - NF:i, :, :]
-                    feat = head.encoder(clip, return_patches=True)
-                    feat = _temporal_avg(feat)
-                    if not head._needs_patches:
-                        feat = feat.mean(dim=1)
-                else:
-                    feat = patches_in_p[:, i - NF, ...]
-                out, state_p = head.forward_temporal_step(feat, state_p)
+                clip = vd[:, :, i - NF:i, :, :]
+                out, state_p = head(clip, state_p)
                 if cfg.get("apply_softmax", False):
                     out = out.softmax(dim=1)
                 preds.append(out[:, 1].cpu())

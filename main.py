@@ -24,8 +24,6 @@ import argparse
 import copy
 
 import gc
-import glob
-import json
 import os
 import random
 import sys
@@ -57,91 +55,6 @@ from movad_core.metrics import evaluation, print_results
 from movad_core.optim import build_optimizer
 from movad_core import utils as movad_utils
 from model import build_multi_head_vjepa
-
-
-# ---------------------------------------------------------------------------
-# Precomputed validation dataset — loads cached encoder embeddings from disk
-# to skip the frozen ViT forward pass during validation.
-# ---------------------------------------------------------------------------
-def pad_collate_embeddings(batch):
-    """Collate precomputed embeddings — pad ``patches_full`` to max clips.
-
-    Each sample is a dict with:
-        ``patches_full`` — ``[n_clips_i, N, D]``  (fp32)
-        ``data_info``   — ``[11]``               (fp32)
-        ``v_len``       — int
-
-    Returns a dict with tensors stacked into ``[B, ...]``.
-    """
-    max_clips = max(b["patches_full"].shape[0] for b in batch)
-    N = batch[0]["patches_full"].shape[1]
-    D = batch[0]["patches_full"].shape[2]
-    B = len(batch)
-    padded = torch.zeros(B, max_clips, N, D, dtype=torch.float32)
-    data_infos = torch.zeros(B, 11)
-    v_lens = torch.zeros(B, dtype=torch.long)
-    for i, item in enumerate(batch):
-        n = item["patches_full"].shape[0]
-        padded[i, :n] = item["patches_full"]
-        data_infos[i] = item["data_info"]
-        v_lens[i] = item["v_len"]
-    return {"patches_full": padded, "data_info": data_infos, "v_len": v_lens}
-
-
-class PrecomputedValDataset(torch.utils.data.Dataset):
-    """Loads precomputed V-JEPA encoder embeddings (``.pt`` files), sorted by
-    video length so adjacent samples in a DataLoader batch have similar
-    durations — minimising padding waste during bucket batching.
-
-    Sorted **descending** (longest videos first): the first batch allocates
-    the largest CUDA memory block; subsequent smaller batches reuse that
-    block without allocator fragmentation.
-
-    Each ``.pt`` file is a dict with keys:
-        ``patches_full`` — fp32 ``[n_clips, N_patches, embed_dim]``
-        ``data_info``   — fp32 ``[11]``  (same format as raw DoTA)
-        ``v_len``       — int, total video frames
-    """
-
-    def __init__(self, embed_dir: str, data_path: str):
-
-        self.files = sorted(glob.glob(os.path.join(embed_dir, "*.pt")))
-        if not self.files:
-            raise FileNotFoundError(f"No *.pt files found in {embed_dir}")
-
-        # Load metadata to sort files by video length — this groups
-        # similar-length videos together for efficient batched padding,
-        # without needing to open every .pt file.
-        metadata_path = os.path.join(data_path, "metadata", "metadata_val.json")
-        with open(metadata_path, "r") as f:
-            metadata = json.load(f)
-
-        # Sort DESCENDING: longest videos first → CUDA allocator grabs the
-        # biggest block upfront and reuses it for all smaller later batches.
-        self.files.sort(key=lambda fp: metadata.get(
-            os.path.splitext(os.path.basename(fp))[0], {}
-        ).get("num_frames", 0), reverse=True)
-
-        self.is_precomputed = True   # flag checked by _evaluate_model
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        return torch.load(self.files[idx], weights_only=True)
-
-
-def _try_build_precomputed_val_loader(data_path: str, batch_size: int, num_workers: int = 0):
-    """Return a DataLoader over precomputed embeddings, or ``None`` if missing."""
-    embed_dir = os.path.join(data_path, "embedding_val")
-    if not os.path.isdir(embed_dir) or not os.listdir(embed_dir):
-        return None
-    dataset = PrecomputedValDataset(embed_dir, data_path)
-    pin = os.name != "nt"
-    return torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin, collate_fn=pad_collate_embeddings,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -378,30 +291,20 @@ def train(cfg, model, traindata_loader, begin_epoch,
     _wandb_run_id = shared_writer.id  # stored once, used for all head checkpoints
 
     # -------------------------------------------------------------------
-    # Per-video temporal loop — identical to single-model version but
-    # parameterised by head name so slot diagnostics route to the right
-    # wandb writer.
+    # Per-video temporal loop — MOVAD-style: each clip passes through
+    # the full model (encoder → projection → temporal → classifier).
     # -------------------------------------------------------------------
-    def _run_temporal_loop(head, patches_or_video, data_info, fb, v_len, head_name, opt,
-                           train_encoder=False):
-        """MOVAD-style per-frame training: backward + step at every frame.
+    def _run_temporal_loop(head, video_data, data_info, fb, v_len, head_name, opt):
+        """MOVAD-style per-frame training: encode + temporal + backward at every frame.
 
-        When ``train_encoder=True``, ``patches_or_video`` is raw video
-        ``[B, C, T, H, W]`` and each frame's clip is encoded individually,
-        giving each temporal step its own independent computation graph
-        (so repeated ``.backward()`` calls don't conflict).
-
-        When ``train_encoder=False``, ``patches_or_video`` is pre-computed
-        encoder output ``[B, n_clips, ...]`` (mega-batch optimisation — safe
-        because the frozen encoder produces no gradient graph).
+        Each clip ``[B, C, NF, H, W]`` passes through the full model:
+        ``head(clip, state)`` handles Swin→pool→proj→LSTM→classifier
+        (or equivalent ViT path) in one call.  This matches the original
+        MOVAD pattern exactly — no pre-computed features, no stale gradients.
         """
         toa_batch = data_info[:, 2]
         tea_batch = data_info[:, 3]
         video_len_orig = data_info[:, 0]
-
-        t_shape = (data_info.shape[0], v_len - fb)
-        targets = torch.full(t_shape, -100).to(data_info.device)
-        outputs_t = torch.full(t_shape, -100, dtype=torch.float).to(data_info.device)
 
         state = None
         slot_diag = {}
@@ -410,23 +313,10 @@ def train(cfg, model, traindata_loader, begin_epoch,
 
         for i in range(fb, v_len):
             target = gt_cls_target(i, toa_batch, tea_batch).long()
+            clip = video_data[:, :, i - fb:i, :, :]   # [B, C, NF, H, W]
 
             with autocast_ctx[head_name]:
-                if train_encoder:
-                    # Encode this single clip — independent graph per frame
-                    clip = patches_or_video[:, :, i - fb:i, :, :]
-                    feat = head.encoder(clip, return_patches=True)
-                    # ViT: temporal average — mean(conv(x_t)) = conv(mean(x_t)),
-                    # lossless since the downstream spatial pool is linear.
-                    # Swin skips this (it processes the full T×S token sequence).
-                    if not head._is_swin:
-                        feat = feat.reshape(feat.shape[0], head._vjepa_n_temp, -1, feat.shape[-1]).mean(dim=1)
-                    if not head._needs_patches:
-                        feat = feat.mean(dim=1)
-                else:
-                    feat = patches_or_video[:, i - fb, ...]
-
-                output, state = head.forward_temporal_step(feat, state)
+                output, state = head(clip, state)
 
             flt = i >= video_len_orig
             target[flt] = -100
@@ -458,12 +348,8 @@ def train(cfg, model, traindata_loader, begin_epoch,
 
             total_loss_val += loss.detach().item()
             frame_count += 1
-            targets[:, i - fb] = target.clone()
-            out = output.max(1)[1]
-            out[target == -100] = -100
-            outputs_t[:, i - fb] = out
 
-        return total_loss_val, frame_count, slot_diag, targets, outputs_t
+        return total_loss_val, frame_count, slot_diag
 
     # -------------------------------------------------------------------
     # Epoch loop
@@ -491,25 +377,13 @@ def train(cfg, model, traindata_loader, begin_epoch,
                 next_video = next_video.to(cfg.device, non_blocking=True)
                 next_info = next_info.to(cfg.device, non_blocking=True)
 
-            # Encoder: mega-batch when frozen, per-frame when training
-            train_enc = cfg.get("train_encoder", False)
-            if not train_enc:
-                with autocast_ctx[head_names[0]]:
-                    patches = model.encode_video_clips(video_data, cfg.NF)
-
-            # Train each head sequentially — independent forward + backward
+            # Train each head sequentially — MOVAD-style per-frame full forward
             postfix_parts = []
             for name in head_names:
                 head = model.heads[name]
 
-                if train_enc:
-                    patches_in = video_data  # raw — encoded per-frame in the loop
-                else:
-                    patches_in = patches if head._needs_patches else patches.mean(dim=2)
-
-                total_loss, f_count, slot_diag, _, _ = _run_temporal_loop(
-                    head, patches_in, data_info, cfg.NF, v_len, name, optimizer[name],
-                    train_encoder=train_enc,
+                total_loss, f_count, slot_diag = _run_temporal_loop(
+                    head, video_data, data_info, cfg.NF, v_len, name, optimizer[name],
                 )
 
                 epoch_losses[name] += total_loss
@@ -607,6 +481,9 @@ def train(cfg, model, traindata_loader, begin_epoch,
 def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ctx=None):
     """Run validation/test inference and compute metrics for all heads.
 
+    Each clip passes through the full model (encoder → temporal → classifier)
+    matching the original MOVAD evaluation pattern exactly.
+
     Parameters
     ----------
     cfg : EasyDict
@@ -633,29 +510,13 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
 
     model.eval()
 
-    # Detect precomputed embedding loader (dataset has an .is_precomputed flag)
-    _precomputed = getattr(testdata_loader.dataset, "is_precomputed", False)
-
     for batch_idx, batch in enumerate(tqdm(testdata_loader, desc=f"Val epoch {epoch}")):
-        if _precomputed:
-            # Collate has already padded patches_full [B, max_clips, N, D] fp16.
-            # Keep fp16 on GPU — the temporal model's LayerNorm+Mamba handle it.
-            data = batch
-            B = data["patches_full"].shape[0]
-            patches = data["patches_full"].to(cfg.device, non_blocking=True)
-            data_info = data["data_info"].to(cfg.device, non_blocking=True)
-            v_lens = data["v_len"].to(cfg.device)  # [B] original frame counts
-            v_len_max = int(v_lens.max())           # max padded length in bucket
-        else:
-            video_data, data_info = batch
-            video_data = video_data.to(cfg.device, non_blocking=True)
-            data_info = data_info.to(cfg.device, non_blocking=True)
-            video_data = torch.swapaxes(video_data, 1, 2)
-            B = video_data.shape[0]
-            v_len_max = video_data.shape[2]         # already padded to max in bucket
-            _ac = autocast_ctx.get(head_names[0], nullcontext()) if autocast_ctx else nullcontext()
-            with _ac:
-                patches = model.encode_video_clips(video_data, fb)
+        video_data, data_info = batch
+        video_data = video_data.to(cfg.device, non_blocking=True)
+        data_info = data_info.to(cfg.device, non_blocking=True)
+        video_data = torch.swapaxes(video_data, 1, 2)
+        B = video_data.shape[0]
+        v_len_max = video_data.shape[2]         # already padded to max in bucket
 
         video_len_orig = data_info[:, 0]            # [B] — truth for masking
         idx_batch = data_info[:, 1]
@@ -665,7 +526,6 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
 
         for name in head_names:
             head = model.heads[name]
-            patches_in = patches if head._needs_patches else patches.mean(dim=2)
 
             t_shape = (B, v_len_max - fb)
             targets = torch.full(t_shape, -100).to(cfg.device)
@@ -674,10 +534,10 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
             state = None
             for i in range(fb, v_len_max):
                 target = gt_cls_target(i, toa_batch, tea_batch).long()
-                feat = patches_in[:, i - fb, ...].float()   # fp16→fp32 for LayerNorm
+                clip = video_data[:, :, i - fb:i, :, :]   # [B, C, NF, H, W]
                 _ac = autocast_ctx.get(name, nullcontext()) if autocast_ctx else nullcontext()
                 with _ac:
-                    output, state = head.forward_temporal_step(feat, state)
+                    output, state = head(clip, state)       # full forward: encoder → temporal → classifier
 
                 # Mask padded positions — identical pattern to training loop
                 flt = i >= video_len_orig
@@ -705,11 +565,6 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
                 res["info_all"].append(info_batch[b].tolist())
                 res["frames_counter"].append(vl)
 
-        # Free GPU tensors from this batch.  With descending sort the
-        # largest block was allocated first; subsequent batches are smaller
-        # and reuse it without fragmentation.
-        if _precomputed:
-            del patches
         # Periodically flush the CUDA caching allocator to release any
         # cached-but-unusable blocks back to the OS.
         if batch_idx % 50 == 0:
@@ -800,45 +655,24 @@ if __name__ == "__main__":
             VCL=cfg.get("VCL", None), phase="train",
         )
 
-        # Validation loader — precomputed embeddings if available, else raw video.
-        # When training the encoder, precomputed embeddings are stale (encoder
-        # changes every epoch) — always use raw video.
+        # Validation loader — always raw video (per-clip full-model forward)
         testdata_loader = None
         if cfg.get("enable_validation", False):
-            if cfg.get("train_encoder", False):
-                test_cfg = copy.deepcopy(cfg)
-                test_cfg.batch_size = cfg.val_batch_size
-                _, testdata_loader = setup_dota(
-                    Dota, test_cfg, num_workers=cfg.num_workers,
-                    VCL=None, phase="test",
-                )
-                print("  train_encoder=True — using raw video for validation (precomputed is stale)")
-            else:
-                testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.val_batch_size, 1)
-                if testdata_loader is not None:
-                    print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
-                else:
-                    test_cfg = copy.deepcopy(cfg)
-                    test_cfg.batch_size = cfg.val_batch_size
-                    _, testdata_loader = setup_dota(
-                        Dota, test_cfg, num_workers=cfg.num_workers,
-                        VCL=None, phase="test",
-                    )
-                    print("  Precomputed embeddings not found — using raw video for validation")
-
-    elif cfg.phase == "test":
-        traindata_loader = None
-        testdata_loader = _try_build_precomputed_val_loader(cfg.data_path, cfg.val_batch_size, 1)
-        if testdata_loader is not None:
-            print(f"  Using precomputed val embeddings from {cfg.data_path}/embedding_val")
-        else:
             test_cfg = copy.deepcopy(cfg)
             test_cfg.batch_size = cfg.val_batch_size
             _, testdata_loader = setup_dota(
                 Dota, test_cfg, num_workers=cfg.num_workers,
                 VCL=None, phase="test",
             )
-            print("  Precomputed embeddings not found — using raw video for testing")
+
+    elif cfg.phase == "test":
+        traindata_loader = None
+        test_cfg = copy.deepcopy(cfg)
+        test_cfg.batch_size = cfg.val_batch_size
+        _, testdata_loader = setup_dota(
+            Dota, test_cfg, num_workers=cfg.num_workers,
+            VCL=None, phase="test",
+        )
 
     # --- Model -------------------------------------------------------------
     epoch_val = 0

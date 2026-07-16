@@ -115,6 +115,7 @@ head.eval()
 
 targets_all, outputs_all, toas_all, teas_all = [], [], [], []
 idxs_all, info_all, frames_counter = [], [], []
+raw_logits_all = []  # collect raw logits (before softmax) to diagnose training regime
 
 amp_dtype = torch.float16 if cfg.get("amp_dtype", "fp32") == "fp16" else None
 autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype) if amp_dtype else __import__('contextlib').nullcontext()
@@ -139,11 +140,6 @@ for idx in tqdm(indices, desc="Evaluating"):
     B = video_data.shape[0]
 
     with torch.no_grad():
-        with autocast_ctx:
-            patches = model.encode_video_clips(video_data, fb)
-
-        patches_in = patches if head._needs_patches else patches.mean(dim=2)
-
         video_len_orig = data_info[:, 0]
         idx_batch = data_info[:, 1]
         toa_batch = data_info[:, 2]
@@ -160,14 +156,18 @@ for idx in tqdm(indices, desc="Evaluating"):
 
         for i in range(fb, v_len):
             target = gt_cls_target(i, toa_batch, tea_batch).long()
-            feat = patches_in[:, i - fb, ...].float()
+            clip = video_data[:, :, i - fb:i, :, :]   # [B, C, NF, H, W]
 
             with autocast_ctx:
-                output, state = head.forward_temporal_step(feat, state)
+                output, state = head(clip, state)       # full forward: encoder → temporal → classifier
 
             flt = i >= video_len_orig
             target[flt] = -100
             output[flt] = -100
+
+            # Capture raw logits BEFORE softmax for diagnosis
+            if i - fb < valid_frames:
+                raw_logits_all.append(output[0].detach().cpu().clone())
 
             if cfg.get("apply_softmax", False):
                 output = output.softmax(dim=1)
@@ -218,3 +218,47 @@ print(f"  Precision:   {precision:.4f}")
 print(f"  Recall:      {recall:.4f}")
 print(f"  Anomaly %:   {gts.mean():.4f}  ({gts.sum():.0f}/{len(gts)} frames)")
 print(f"{'='*60}")
+
+# ── Raw logit diagnosis ─────────────────────────────────────────────────
+# Double-softmax: loss = CE(softmax(softmax(logits)), target)
+#   The inner softmax squashes logits → [0,1]; the outer softmax then
+#   softmax([p, 1-p]) = sigmoid(2p-1) ≈ [0.27, 0.73] max confidence.
+#   Gradient dL/d(b-a) = (sigmoid(sigmoid(b-a)) - t) * sigmoid'(b-a) * sigmoid'(sigmoid(b-a))
+#   At |b-a| = 2: gradient ≈ 0.02×  (90% dead)
+#   At |b-a| = 4: gradient ≈ 0.0001× (dead)
+#   The model CANNOT push |b-a| past ~3 — there's no gradient signal.
+#
+# Standard CE: loss = CE(logits, target)
+#   Gradient dL/d(b-a) = (sigmoid(b-a) - t) — never vanishes.
+#   |b-a| grows unbounded as the model gains confidence.
+#
+# So the diagnostic is |diff| = |b-a|:
+#   |diff|_max < 3   → consistent with double-softmax training
+#   |diff|_max > 6   → physically impossible under double-softmax
+if raw_logits_all:
+    raw = torch.stack(raw_logits_all)  # [N, 2]
+    class0 = raw[:, 0]
+    class1 = raw[:, 1]
+    diff = class1 - class0  # sigmoid(diff) = softmax(logits)[:, 1]
+    d_abs_max = diff.abs().max().item()
+    print(f"\n{'='*60}")
+    print("RAW LOGIT DIAGNOSIS (before softmax)")
+    print(f"{'='*60}")
+    print(f"  Samples:           {len(raw_logits_all)}")
+    print(f"  class-0 logit:     [{class0.min():.2f}, {class0.max():.2f}]  mean={class0.mean():.2f}  std={class0.std():.2f}")
+    print(f"  class-1 logit:     [{class1.min():.2f}, {class1.max():.2f}]  mean={class1.mean():.2f}  std={class1.std():.2f}")
+    print(f"  diff = b-a:        [{diff.min():.2f}, {diff.max():.2f}]  mean={diff.mean():.2f}  std={diff.std():.2f}")
+    # Anti-correlation check: if a ≈ -b then softmax on/off same ranking
+    corr_ab = (class0 * class1).mean() / (class0.std() * class1.std() + 1e-8)
+    print(f"  corr(a, b):        {corr_ab:.3f}  (≈ -1.0 → a = -b → softmax on/off same AUC)")
+    print()
+    if d_abs_max > 6:
+        print(f"  |b-a|_max = {d_abs_max:.1f} > 6 → gradient-dead under double-softmax")
+        print(f"  ✓ CHECKPOINT WAS TRAINED WITHOUT DOUBLE-SOFTMAX")
+    elif d_abs_max > 3:
+        print(f"  |b-a|_max = {d_abs_max:.1f} > 3 → unlikely under double-softmax")
+        print(f"  ⚠ CHECKPOINT WAS LIKELY TRAINED WITHOUT DOUBLE-SOFTMAX")
+    else:
+        print(f"  |b-a|_max = {d_abs_max:.1f} < 3 → compatible with double-softmax")
+        print(f"  → Inconclusive — could be either regime")
+    print(f"{'='*60}")

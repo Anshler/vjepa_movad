@@ -220,12 +220,13 @@ if _HAS_MAMBA_SSM and _HAS_CKPT:
                 print(f"  [{name}] step 1: anomaly_prob={prob:.4f}")
         print(f"    ✓ {name} streaming OK (3 steps)")
 
-    # Test: encode_video_clips shared path
+    # Test: per-clip encoding across multiple clip indices
     video = torch.randn(2, 3, 16, cfg_multi.img_size, cfg_multi.img_size).to(DEVICE)
-    with torch.no_grad():
-        patches = model_multi.encode_video_clips(video, 4)
-    print(f"\n  encode_video_clips: {tuple(patches.shape)}")
-    print(f"    ✓ shared encode OK")
+    with torch.no_grad(), _autocast():
+        clip = video[:, :, :4, :, :]   # first 4-frame clip
+        out, _ = model_multi.heads[next(iter(model_multi.heads.keys()))](clip, None)
+    print(f"\n  per-clip encoding: clip {tuple(clip.shape)} → output {tuple(out.shape)}")
+    print(f"    ✓ per-clip encode OK")
 
     print("\n  All 6 heads pass streaming smoke tests ✓")
 else:

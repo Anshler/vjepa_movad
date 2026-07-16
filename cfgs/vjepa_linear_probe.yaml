@@ -21,6 +21,7 @@ checkpoint_path: null
 checkpoint_key: ema_encoder
 vjepa_spatial_grid: [6, 6]
 pool: mean
+compile: false
 
 # --- Temporal model -------------------------------------------------------
 temporal_model: none                 # <-- no recurrence, pure per-frame MLP
