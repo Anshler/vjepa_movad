@@ -5,11 +5,14 @@ Usage:
     python tests/test_overfit.py                    # frozen, lr=0.01
     python tests/test_overfit.py --train_encoder    # trainable, lr=0.01
     python tests/test_overfit.py --softmax          # with old double-softmax behavior
+    python tests/test_overfit.py --real_data        # shortest real video from DoTA
 """
 from __future__ import annotations
 
-import argparse, os, sys, numpy as np, torch, torch.nn.functional as F, yaml
+import argparse, os, sys, json, numpy as np, torch, torch.nn.functional as F, yaml
 from easydict import EasyDict
+from PIL import Image
+import torchvision.transforms.functional as TF
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -27,7 +30,7 @@ from movad_core.losses import build_loss
 from movad_core.optim import build_optimizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="cfgs/swin_mamba.yaml",
+parser.add_argument("--config", default="cfgs/swin_lstm.yaml",
                     help="Path to config YAML (e.g. cfgs/swin_lstm.yaml or cfgs/vjepa_v1.yaml)")
 parser.add_argument("--checkpoint", default=None,
                     help="Override checkpoint path (uses config value if not set)")
@@ -36,23 +39,20 @@ parser.add_argument("--lr", type=float, default=0.01)
 parser.add_argument("--train_encoder", action="store_true", default=False)
 parser.add_argument("--softmax", action="store_true", default=False,
                     help="Enable double-softmax (for comparing with old behavior)")
+parser.add_argument("--real_data", action="store_true", default=False,
+                    help="Use the shortest real video from DoTA instead of synthetic data")
 args = parser.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 apply_softmax = args.softmax
-print(f"Device: {DEVICE}  |  train_encoder={args.train_encoder}  |  lr={args.lr}  |  epochs={args.epochs}  |  softmax={apply_softmax}")
+print(f"Device: {DEVICE}  |  train_encoder={args.train_encoder}  |  lr={args.lr}"
+      f"  |  epochs={args.epochs}  |  softmax={apply_softmax}  |  real_data={args.real_data}")
 
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 
 # --- Build model ---
 cfg_path = os.path.join(_REPO_ROOT, args.config)
-with open(cfg_path, "r") as f:
-    base_cfg = EasyDict(yaml.safe_load(f))
-NF = base_cfg.get("num_frames", 4)
-VCL = base_cfg.get("VCL", 8)
-img_size = base_cfg.get("img_size", 256)
-
 cfg = EasyDict(yaml.safe_load(open(cfg_path)))
 cfg.device = DEVICE
 cfg.checkpoint_path = args.checkpoint or cfg.get("checkpoint_path")
@@ -61,6 +61,10 @@ cfg.lr = args.lr
 cfg.train_encoder = args.train_encoder
 cfg._head_cfgs_flat = [dict(cfg)]
 cfg._head_cfgs_flat[0]["name"] = "test_head"
+
+NF = cfg.get("num_frames", 4)
+config_VCL = cfg.get("VCL", 8)
+input_shape = cfg.get("input_shape", [256, 256])
 
 model = build_multi_head_vjepa(cfg)
 head_name = next(iter(model.heads.keys()))
@@ -75,37 +79,87 @@ opt, _ = build_optimizer(EasyDict({"lr": args.lr}), head, None)
 model.to(DEVICE)
 model.train()
 
-# --- Synthetic data ---
-B = 2
-vd = torch.randn(B, 3, VCL, img_size, img_size, device=DEVICE)
-di = torch.zeros(B, 11, device=DEVICE)
-di[:, 0] = VCL
-di[:, 1] = torch.arange(B)
-di[:, 2] = -1
-di[:, 3] = -1
-di[:, 4] = -1
-for b in range(B // 2, B):
-    di[b, 2] = 4
-    di[b, 3] = 6
-    di[b, 4] = 1
+# --- Data ---
+if args.real_data:
+    # Load metadata, find the shortest video with an anomaly window
+    DATA_PATH = cfg.get("data_path", "D:/Users/Chrysenberg69420/Downloads/DoTA_dataset")
+    meta_path = os.path.join(DATA_PATH, "metadata", "metadata_val.json")
+    with open(meta_path) as f:
+        metadata = json.load(f)
 
-print(f"Synthetic: {B} videos, {VCL} frames, labels={di[:, 4].int().tolist()}")
+    shortest = None
+    for key, info in metadata.items():
+        nf = info["num_frames"]
+        astart = info.get("anomaly_start", -1)
+        if astart < 0 or nf <= NF + 2:    # need at least a few valid frames
+            continue
+        if shortest is None or nf < shortest[0]:
+            shortest = (nf, key, astart, info["anomaly_end"])
+
+    assert shortest is not None, "No anomaly video found!"
+    n_frames, video_key, a_start, a_end = shortest
+    print(f"\nShortest anomaly video: {video_key}")
+    print(f"  Frames: {n_frames}  Anomaly window: [{a_start}, {a_end}]  ({a_end - a_start + 1}f)")
+
+    # Load raw frames
+    frames_dir = os.path.join(DATA_PATH, "frames", video_key, "images")
+    frame_files = sorted(os.listdir(frames_dir))[:n_frames]
+    frames_np = np.array([np.asarray(Image.open(os.path.join(frames_dir, f)))
+                           for f in frame_files]).astype(np.float32)
+    # frames_np: [T, H, W, C]
+
+    # Preprocess: resize + normalize to [-1, 1]  (matching Dota transforms)
+    input_shape = cfg.get("input_shape", [240, 320])
+    H_in, W_in = input_shape
+    frames_t = torch.from_numpy(frames_np).permute(0, 3, 1, 2)          # [T, C, OH, OW]
+    frames_t = TF.resize(frames_t, [H_in, W_in], antialias=True)         # [T, C, H_in, W_in]
+    frames_t = (frames_t / 255.0 - 0.5) / 0.5                            # normalize [-1, 1]
+
+    # → [1, C, T, H, W]
+    vd = frames_t.permute(1, 0, 2, 3).unsqueeze(0).to(DEVICE)
+    v_len = n_frames
+    VCL = v_len   # use full video (the overfit loop iterates from NF to VCL)
+    B = 1
+
+    di = torch.zeros(B, 11, device=DEVICE)
+    di[:, 0] = v_len
+    di[:, 1] = 0
+    di[:, 2] = a_start
+    di[:, 3] = a_end
+    di[:, 4] = 1
+
+    print(f"  Tensor: {tuple(vd.shape)}  VCL={VCL}  valid_frames={VCL - NF}")
+else:
+    # --- Synthetic data ---
+    VCL = config_VCL
+    B = 2
+    vd = torch.randn(B, 3, VCL, input_shape[0], input_shape[1], device=DEVICE)
+    di = torch.zeros(B, 11, device=DEVICE)
+    di[:, 0] = VCL
+    di[:, 1] = torch.arange(B)
+    di[:, 2] = -1
+    di[:, 3] = -1
+    di[:, 4] = -1
+    for b in range(B // 2, B):
+        di[b, 2] = 4
+        di[b, 3] = 6
+        di[b, 4] = 1
+
+    print(f"\nSynthetic: {B} videos, {VCL} frames, labels={di[:, 4].int().tolist()}")
+    v_len = VCL
+
 n_params = sum(p.numel() for p in head.parameters() if p.requires_grad)
 print(f"Trainable params in head: {n_params:,}")
 
 # --- Feature diversity check ---
-MAX_PAIRWISE = 2000  # cap tokens to avoid O(N²×D) broadcast OOM
+MAX_PAIRWISE = 2000
 
-# ViT encoder returns [B, T·S, D] raw tokens; temporal average mirrors
-# encode_video_clips.  Swin skips this — it processes the full sequence.
 def _temporal_avg(feat):
     if head._is_swin:
         return feat
     return feat.reshape(feat.shape[0], head._vjepa_n_temp, -1, feat.shape[-1]).mean(dim=1)
 
 def _sim_report(t, label):
-    """Print pairwise cosine similarity stats for a set of vectors.
-    Caps at MAX_PAIRWISE tokens (random subset) to stay within GPU memory."""
     flat = t.reshape(-1, t.shape[-1])
     n = flat.shape[0]
     if n > MAX_PAIRWISE:
@@ -114,38 +168,33 @@ def _sim_report(t, label):
         n_label = f"sampled {MAX_PAIRWISE}/{n}"
     else:
         n_label = str(n)
-    # Chunked all-pairs cosine sim to avoid the [N,N,D] broadcast
     sims = []
     chunk = 128
     for i in range(0, flat.shape[0], chunk):
-        q = flat[i : i + chunk]                              # [c, D]
-        s = F.cosine_similarity(
-            q.unsqueeze(1), flat.unsqueeze(0), dim=-1)       # [c, N]
+        q = flat[i : i + chunk]
+        s = F.cosine_similarity(q.unsqueeze(1), flat.unsqueeze(0), dim=-1)
         sims.append(s)
-    sims = torch.cat(sims, dim=0)                            # [N, N]
+    sims = torch.cat(sims, dim=0)
     mask = ~torch.eye(sims.shape[0], dtype=torch.bool, device=sims.device)
     off = sims[mask]
+    if off.numel() == 0:
+        print(f"  {label}: tokens={n_label}  sim=N/A (single token — no pairs)")
+        return
     print(f"  {label}: tokens={n_label}  sim=[{off.min():.4f}, {off.max():.4f}]  mean={off.mean():.4f}")
 
 with torch.no_grad():
     if args.train_encoder:
         patches_check = head.encoder(vd[:, :, :NF, :, :], return_patches=True)
-        patches_check = _temporal_avg(patches_check)  # [B, T·S, D] → [B, S, D] (ViT only)
-        # patches_check: [B, N_patches, embed_dim]
+        patches_check = _temporal_avg(patches_check)
         _sim_report(patches_check, "patch tokens")
         _sim_report(patches_check.mean(dim=1, keepdim=True), "pooled (mean)")
     else:
         patches_check = model.encode_video_clips(vd, NF)
-        # patches_check: [B, n_clips, N_patches, embed_dim]
         _sim_report(patches_check, "patch tokens (all)")
         _sim_report(patches_check.mean(dim=2, keepdim=True), "pooled (mean over patches)")
-        # Also check: are patches within one clip diverse, or all collapsed?
         if patches_check.shape[2] > 1:
-            single_clip = patches_check[0, 0]  # [N_patches, embed_dim] — first clip
+            single_clip = patches_check[0, 0]
             _sim_report(single_clip, "patches within ONE clip")
-    # Flatten to [total_tokens, D] for a summary similarity check.
-    # Cap tokens to avoid the same O(N²×D) broadcast that _sim_report guards against
-    # (9216 tokens × 768D × 4 bytes = 260 GiB broadcast intermediate).
     feats_flat = patches_check.reshape(-1, patches_check.shape[-1]) if head._needs_patches else patches_check.mean(dim=2).reshape(-1, patches_check.shape[-1])
     n_feats = feats_flat.shape[0]
     if n_feats > MAX_PAIRWISE:
@@ -155,7 +204,6 @@ with torch.no_grad():
 
 # --- Overfit ---
 for epoch in range(args.epochs):
-    print(epoch)
     if args.train_encoder:
         patches_in = vd
     else:
@@ -177,7 +225,7 @@ for epoch in range(args.epochs):
         if args.train_encoder:
             clip = vd[:, :, i - NF:i, :, :]
             feat = head.encoder(clip, return_patches=True)
-            feat = _temporal_avg(feat)  # [B, T·S, D] → [B, S, D] (ViT only)
+            feat = _temporal_avg(feat)
             if not head._needs_patches:
                 feat = feat.mean(dim=1)
         else:
@@ -203,7 +251,7 @@ for epoch in range(args.epochs):
 
     avg_loss = epoch_loss / max(frame_count, 1)
 
-    if epoch == 0 or (epoch + 1) % 25 == 0:
+    if epoch == 0 or (epoch + 1) % 10 == 0:
         with torch.no_grad():
             if not args.train_encoder:
                 patches_p = model.encode_video_clips(vd, NF)
@@ -214,7 +262,7 @@ for epoch in range(args.epochs):
                 if args.train_encoder:
                     clip = vd[:, :, i - NF:i, :, :]
                     feat = head.encoder(clip, return_patches=True)
-                    feat = _temporal_avg(feat)  # [B, T·S, D] → [B, S, D] (ViT only)
+                    feat = _temporal_avg(feat)
                     if not head._needs_patches:
                         feat = feat.mean(dim=1)
                 else:
@@ -225,12 +273,13 @@ for epoch in range(args.epochs):
                 preds.append(out[:, 1].cpu())
             all_preds = torch.stack(preds, dim=1)
 
-        # Check if params moved
         grads_ok = 0
         for p in head.parameters():
             if p.grad is not None and p.grad.norm().item() > 1e-10:
                 grads_ok += 1
-        print(f"  ep {epoch+1:3d}: loss={avg_loss:.6f}  pred=[{all_preds.min():.4f}, {all_preds.max():.4f}]  mean={all_preds.mean():.4f}  params_w_grad={grads_ok}")
+        print(f"  ep {epoch+1:3d}: loss={avg_loss:.6f}"
+              f"  pred_range=[{all_preds.min():.4f}, {all_preds.max():.4f}]"
+              f"  mean={all_preds.mean():.4f}  n_frames={all_preds.shape[1]}  params_w_grad={grads_ok}")
 
 final_loss = avg_loss
 learned = abs(final_loss - 0.693) > 0.02 and final_loss < 0.65

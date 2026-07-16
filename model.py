@@ -938,7 +938,7 @@ class ClsVJEPA(nn.Module):
         if self._keep_patches:
             x = self._spatial_pool_tokens(x).reshape(x.shape[0], -1)   # [B, grid_size*D]
         elif self._is_swin:
-            x = x.flatten(1)    # [B, 36, C] → [B, 36*C]  (MOVAD projection)
+            x = x.transpose(1, 2).flatten(1)    # [B, C, 36] → [B, C*36]  (spatial-fast → MOVAD-compatible order)
         x = self.bn(x)
         x = F.relu(self.lin1(x))
         x = self.drop(x)
@@ -966,7 +966,7 @@ class ClsVJEPA(nn.Module):
             x = self._spatial_pool_tokens(x, self._vjepa_n_temp).reshape(x.shape[0], -1)
         elif self._is_swin:
             x = self.encoder(x, return_patches=True)           # [B, 36, embed_dim]
-            x = x.flatten(1)                                   # [B, 36*C]
+            x = x.transpose(1, 2).flatten(1)                   # [B, C*36]  (spatial-fast → MOVAD-compatible order)
         else:
             x = self.encoder(x)                                # [B, embed_dim]
         x = self.bn(x)

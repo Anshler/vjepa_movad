@@ -10,9 +10,10 @@
 
 # --- Encoder ----------------------------------------------------------------
 model_name: swin_base_ssv2           # → swin_base_patch244_window1677_sthv2
-img_size: 256
 num_frames: 4
 checkpoint_path: pretrained/swin_base_patch244_window1677_sthv2.pth
+compile: false
+apply_softmax: true
 
 # --- Temporal model ---------------------------------------------------------
 temporal_model: mamba
