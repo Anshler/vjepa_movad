@@ -1,9 +1,10 @@
 """
 MOVAD anomaly classifier with a frozen V-JEPA 2.1 encoder backbone.
 
-Supports four temporal model variants:
+Supports five temporal model variants:
   - ``lstm``           — 3-layer LSTM (original MOVAD design)
   - ``mamba``          — 3 Mamba SSM blocks (mamba_ssm package)
+  - ``mamba3``         — 3 Mamba3 SSM blocks with RoPE (mamba_ssm package)
   - ``slotssm``        — modular slots, per-slot Mamba, cross+self-attention
   - ``sparse_slotssm`` — SlotSSM + top-k sparse gating
 
@@ -28,13 +29,14 @@ from swin_encoder import SwinEncoder, build_swin_encoder
 # Mamba_ssm import
 # ---------------------------------------------------------------------------
 try:
-    from mamba_ssm import Mamba, Mamba2
+    from mamba_ssm import Mamba, Mamba2, Mamba3
 
     _HAS_MAMBA_SSM = True
 except ImportError:
     _HAS_MAMBA_SSM = False
     Mamba = None
     Mamba2 = None
+    Mamba3 = None
 
 
 def _require_mamba():
@@ -189,7 +191,7 @@ def _weights_init(m):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         if m.bias is not None:
             torch.nn.init.constant_(m.bias, 0)
-    if isinstance(m, nn.LSTMCell):
+    if isinstance(m, nn.LSTM):
         for param in m.parameters():
             if len(param.shape) >= 2:
                 torch.nn.init.orthogonal_(param.data)
@@ -251,35 +253,95 @@ class LSTMTemporalModel(nn.Module):
 
 
 # ===========================================================================
-# Temporal model: Mamba (streaming via MambaCache)
+# Temporal model: Mamba / Mamba2 / Mamba3 (streaming via MambaCache)
 # ===========================================================================
 class MambaTemporalModel(nn.Module):
+    """Multi-block Mamba temporal model with streaming inference.
+
+    Supports three Mamba versions via ``mamba_version``:
+
+    - ``"mamba1"`` — original Mamba (Mamba-1 SSM with conv + SiLU)
+    - ``"mamba2"`` — Mamba-2 SSM (structured state-space duality)
+    - ``"mamba3"`` — Mamba-3 SSM (RoPE, no conv, 4 state tensors per layer)
+
+    All versions share the same streaming interface: each frame ``[B, D]``
+    passes through residual Mamba blocks, with state held in a ``MambaCache``
+    (``Mamba3.step()`` is called directly for subsequent frames to work around
+    a shape mismatch in its own ``forward()``).
+    """
+
     def __init__(
         self, dim: int, expand: int = 2, d_state: int = 128, d_conv: int = 4,
         num_blocks: int = 3, mamba_version: str = "mamba2",
+        # --- Mamba3-specific (ignored for mamba1/mamba2) ---
+        headdim: int = 64,
+        ngroups: int = 1,
+        is_mimo: bool = False,
+        mimo_rank: int = 4,
+        chunk_size: int = 64,
+        is_outproj_norm: bool = False,
     ):
         super().__init__()
         _require_mamba()
-        mamba_cls = Mamba2 if mamba_version == "mamba2" else Mamba
+        self.mamba_version = mamba_version
         self.blocks = nn.ModuleList()
         self.norms = nn.ModuleList()
+
         for i in range(num_blocks):
-            kw = dict(d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand, layer_idx=i)
-            if mamba_version == "mamba2":
-                kw["headdim"] = 64
-                assert (dim * expand / 64) % 8 == 0, (
-                    f"Mamba2 requires (d_model * expand / headdim) %% 8 == 0, "
-                    f"got ({dim} * {expand} / 64) = {dim * expand / 64}"
+            if mamba_version == "mamba3":
+                blk = Mamba3(
+                    d_model=dim, d_state=d_state, expand=expand,
+                    headdim=headdim, ngroups=ngroups,
+                    is_mimo=is_mimo, mimo_rank=mimo_rank,
+                    chunk_size=chunk_size, layer_idx=i,
+                    is_outproj_norm=is_outproj_norm,
                 )
-            self.blocks.append(mamba_cls(**kw))
+            else:
+                mamba_cls = Mamba2 if mamba_version == "mamba2" else Mamba
+                kw = dict(d_model=dim, d_state=d_state, d_conv=d_conv,
+                          expand=expand, layer_idx=i)
+                if mamba_version == "mamba2":
+                    kw["headdim"] = 64
+                    assert (dim * expand / 64) % 8 == 0, (
+                        f"Mamba2 requires (d_model * expand / headdim) %% 8 == 0, "
+                        f"got ({dim} * {expand} / 64) = {dim * expand / 64}"
+                    )
+                blk = mamba_cls(**kw)
+            self.blocks.append(blk)
             self.norms.append(nn.LayerNorm(dim))
 
     def forward(self, x, cache: MambaCache | None = None):
+        # x: [B, D] — one frame at a time (streaming)
         if cache is None:
             cache = MambaCache()
-        h = x.unsqueeze(1)
-        for blk, norm in zip(self.blocks, self.norms):
-            h = blk(norm(h), inference_params=cache) + h
+
+        h = x.unsqueeze(1)                                     # [B, 1, D]
+
+        if self.mamba_version == "mamba3":
+            # Mamba3's step() expects squeezed [B, D], but its own forward()
+            # passes [B, 1, D] when seqlen_offset > 0 — call step() directly.
+            is_first_step = cache.seqlen_offset == 0
+            for i, (blk, norm) in enumerate(zip(self.blocks, self.norms)):
+                h_normed = norm(h.squeeze(1)).unsqueeze(1)     # [B, 1, D]
+                if is_first_step:
+                    # Full scan on seqlen=1 → populates the 4 cache state tensors
+                    out = blk(h_normed, inference_params=cache)
+                else:
+                    angle_state, ssm_state, k_state, v_state = (
+                        cache.key_value_memory_dict[i]
+                    )
+                    out, _, _, _, _ = blk.step(
+                        h_normed.squeeze(1),                   # [B, D]
+                        angle_state, ssm_state, k_state, v_state,
+                    )
+                    out = out.unsqueeze(1)
+                h = out + h
+        else:
+            # Mamba1 / Mamba2: forward() handles step() transparently
+            for blk, norm in zip(self.blocks, self.norms):
+                h = blk(norm(h.squeeze(1)).unsqueeze(1),
+                        inference_params=cache) + h
+
         cache.seqlen_offset += 1
         return h.squeeze(1), cache
 

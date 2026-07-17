@@ -1,9 +1,10 @@
 """
 Entry point: V-JEPA 2.1 + MOVAD training / evaluation.
 
-Supports four temporal model variants via config key ``temporal_model``:
+Supports five temporal model variants via config key ``temporal_model``:
   - ``lstm`` (default)
   - ``mamba``
+  - ``mamba3``
   - ``slotssm``
   - ``sparse_slotssm``
 
