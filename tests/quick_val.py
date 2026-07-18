@@ -172,9 +172,11 @@ for idx in tqdm(indices, desc="Evaluating"):
             if cfg.get("apply_softmax", False):
                 output = output.softmax(dim=1)
 
+            # Store class-1 probability (not raw logit) so threshold 0.5 is meaningful
+            prob = output if cfg.get("apply_softmax", False) else output.softmax(dim=1)
             if i - fb < valid_frames:
                 video_targets.append(target[0].item())
-                video_outputs.append(output[0, 1].item())
+                video_outputs.append(prob[0, 1].item())
 
     targets_all.append(video_targets)
     outputs_all.append(video_outputs)

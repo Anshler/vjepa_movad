@@ -549,7 +549,9 @@ def _evaluate_model(cfg, model, testdata_loader, epoch, writer=None, autocast_ct
                     output = output.softmax(dim=1)
 
                 targets[:, i - fb] = target.clone()
-                outputs[:, i - fb] = output[:, 1].clone()
+                # Store class-1 probability (not raw logit) so threshold 0.5 is meaningful
+                prob = output if cfg.get("apply_softmax", False) else output.softmax(dim=1)
+                outputs[:, i - fb] = prob[:, 1].clone()
 
             res = per_head[name]
             # Append per-video results, filtering out padded frames

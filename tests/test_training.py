@@ -286,7 +286,8 @@ with torch.no_grad():
             output, state_val = head(clip, state_val)
         if head_cfgs[head_name].get("apply_softmax", False):
             output = output.softmax(dim=1)
-        outputs_val[:, i - NF] = output[:, 1]
+        prob = output if head_cfgs[head_name].get("apply_softmax", False) else output.softmax(dim=1)
+        outputs_val[:, i - NF] = prob[:, 1]
 
 print(f"  val outputs: {tuple(outputs_val.shape)}")
 print(f"  val anomaly scores: min={outputs_val.min().item():.4f}  max={outputs_val.max().item():.4f}")
