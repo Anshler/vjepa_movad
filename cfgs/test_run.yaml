@@ -46,7 +46,7 @@ enable_validation: true
 validation_epoch_step: 10
 num_workers: 4
 
-amp_dtype: fp16
+amp_dtype: bf16
 
 # --- Augmentation ---------------------------------------------------------
 horizontal_flip_prob: 0.0
