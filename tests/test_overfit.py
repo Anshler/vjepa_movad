@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse, os, sys, json, numpy as np, torch, torch.nn.functional as F, yaml
+from contextlib import nullcontext
 from easydict import EasyDict
 from PIL import Image
 import torchvision.transforms.functional as TF
@@ -30,7 +31,7 @@ from movad_core.losses import build_loss
 from movad_core.optim import build_optimizer
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="cfgs/swin_lstm.yaml",
+parser.add_argument("--config", default="cfgs/swin_mamba.yaml",
                     help="Path to config YAML (e.g. cfgs/swin_lstm.yaml or cfgs/vjepa_v1.yaml)")
 parser.add_argument("--checkpoint", default=None,
                     help="Override checkpoint path (uses config value if not set)")
@@ -61,6 +62,11 @@ cfg.lr = args.lr
 cfg.train_encoder = args.train_encoder
 cfg._head_cfgs_flat = [dict(cfg)]
 cfg._head_cfgs_flat[0]["name"] = "test_head"
+
+_amp_cfg = cfg.get("amp_dtype", "fp32")
+_amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_amp_cfg)
+autocast_ctx = torch.amp.autocast("cuda", dtype=_amp_dtype) if _amp_dtype else nullcontext()
+print(f"  amp_dtype={_amp_cfg}")
 
 NF = cfg.get("num_frames", 4)
 config_VCL = cfg.get("VCL", 8)
@@ -205,7 +211,8 @@ for epoch in range(args.epochs):
 
         # MOVAD-style: full clip → full model forward in one call
         clip = vd[:, :, i - NF:i, :, :]          # [B, C, NF, H, W]
-        output, state = head(clip, state)          # encoder → projection → temporal → classifier
+        with autocast_ctx:
+            output, state = head(clip, state)      # encoder → projection → temporal → classifier
 
         flt = i >= video_len_orig
         target[flt] = -100
@@ -231,7 +238,8 @@ for epoch in range(args.epochs):
             preds = []
             for i in range(NF, VCL):
                 clip = vd[:, :, i - NF:i, :, :]
-                out, state_p = head(clip, state_p)
+                with autocast_ctx:
+                    out, state_p = head(clip, state_p)
                 if cfg.get("apply_softmax", False):
                     out = out.softmax(dim=1)
                 preds.append(out[:, 1].cpu())
