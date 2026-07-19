@@ -60,7 +60,6 @@ except ImportError:
     _HAS_FLASH_ATTN = False
     FlashMHA = None
 
-
 # ---------------------------------------------------------------------------
 # MambaCache — identical to the SlotSSM repo.
 # ---------------------------------------------------------------------------
@@ -438,6 +437,11 @@ class SlotSSMBlock(nn.Module):
             )
         self._gate_entropy = torch.tensor(0.0)  # accumulated per forward pass
 
+        # --- Diagnostics (populated during forward when _diag_enabled=True) ---
+        self._diag_enabled = False
+        self._diag_gate_scores: list = []   # [B, K] per step
+        self._diag_active_idx: list = []    # [B, top_k] per step
+
         # Per-slot Mamba
         kw = dict(d_model=slot_dim, d_state=mamba_d_state, d_conv=mamba_d_conv,
                   expand=mamba_expand, layer_idx=block_idx)
@@ -594,6 +598,11 @@ class SlotSSMBlock(nn.Module):
             entropy = -(p * (p + 1e-9).log()).sum(dim=-1).mean()     # scalar
             self._gate_entropy = entropy.detach()
 
+        # --- Diagnostics: capture gate scores and active indices ---
+        if self._diag_enabled:
+            self._diag_gate_scores.append(gate_scores.detach().cpu())
+            self._diag_active_idx.append(active_idx.detach().cpu())
+
         # --- First step: Mamba cache not yet initialised for this block.
         #     Run scan path on all K slots to populate the cache, then
         #     fall through to the mask-based path (same as before).
@@ -691,6 +700,49 @@ class SlotSSMTemporalModel(nn.Module):
         self._slot_mass_mean = torch.tensor(float("nan"))
         self._slot_usage_frac = torch.tensor(float("nan"))
 
+        # --- Diagnostic collection (opt-in, off by default) ---
+        self._diag_slots: list | None = None   # final slot states [B, K, D] per step
+
+    def enable_diagnostics(self):
+        """Enable per-step collection of gate scores, active indices, and slot states."""
+        for blk in self.blocks:
+            blk._diag_enabled = True
+            blk._diag_gate_scores = []
+            blk._diag_active_idx = []
+        self._diag_slots = []
+
+    def disable_diagnostics(self):
+        """Disable diagnostic collection and free stored data."""
+        for blk in self.blocks:
+            blk._diag_enabled = False
+            blk._diag_gate_scores = []
+            blk._diag_active_idx = []
+        self._diag_slots = []
+
+    def get_diagnostics(self) -> dict:
+        """Return collected diagnostics after a forward pass.
+
+        Returns
+        -------
+        dict with keys:
+            gate_scores : list[list[Tensor]]  — per-block list of [B, K] gate logits
+            active_idx  : list[list[Tensor]]  — per-block list of [B, top_k] active indices
+            slots       : list[Tensor]        — [B, K, D] final slot state per step
+            entropy     : list[float]         — gate entropy per block (sum across steps)
+            mass_min    : float               — minimum slot mass (inverted attn only, else NaN)
+            mass_mean   : float
+            usage_frac  : float
+        """
+        return {
+            "gate_scores": [list(blk._diag_gate_scores) for blk in self.blocks],
+            "active_idx": [list(blk._diag_active_idx) for blk in self.blocks],
+            "slots": list(self._diag_slots) if self._diag_slots is not None else [],
+            "entropy": [float(blk._gate_entropy) for blk in self.blocks],
+            "mass_min": float(self._slot_mass_min),
+            "mass_mean": float(self._slot_mass_mean),
+            "usage_frac": float(self._slot_usage_frac),
+        }
+
     def forward(self, patches, cache: MambaCache | None = None):
         B = patches.shape[0]
         if cache is None:
@@ -708,6 +760,10 @@ class SlotSSMTemporalModel(nn.Module):
         self._slot_mass_min = min(blk._slot_mass_min for blk in self.blocks)
         self._slot_mass_mean = (sum(blk._slot_mass_mean for blk in self.blocks) / len(self.blocks))
         self._slot_usage_frac = min(blk._slot_usage_frac for blk in self.blocks)
+
+        # --- Diagnostics: store final slot states ---
+        if self._diag_slots is not None:
+            self._diag_slots.append(slots.detach().cpu())
 
         cache.seqlen_offset += 1
         return slots, cache                                          # [B, K, D]
@@ -761,6 +817,7 @@ class ClsVJEPA(nn.Module):
         self._use_spatial_grid = (
             vjepa_spatial_grid is not None
             and not self._is_swin
+            and temporal_model not in ("slotssm", "sparse_slotssm")
         )
         if self._use_spatial_grid:
             self._grid_size = vjepa_spatial_grid[0] * vjepa_spatial_grid[1]
