@@ -817,7 +817,6 @@ class ClsVJEPA(nn.Module):
         self._use_spatial_grid = (
             vjepa_spatial_grid is not None
             and not self._is_swin
-            and temporal_model not in ("slotssm", "sparse_slotssm")
         )
         if self._use_spatial_grid:
             self._grid_size = vjepa_spatial_grid[0] * vjepa_spatial_grid[1]
