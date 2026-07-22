@@ -74,12 +74,9 @@ from model import build_multi_head_vjepa
 def parse_configs():
     parser = argparse.ArgumentParser(description="V-JEPA 2.1 + MOVAD anomaly detection")
     _DEFAULT_CONFIGS = [
-        "cfgs/vjepa_v1.yaml",
         "cfgs/vjepa_mamba.yaml",
         "cfgs/vjepa_slotssm.yaml",
         "cfgs/vjepa_sparse_slotssm.yaml",
-        "cfgs/vjepa_slotssm_inv.yaml",
-        "cfgs/vjepa_sparse_slotssm_inv.yaml",
     ]
     parser.add_argument("--config", nargs="+", default=_DEFAULT_CONFIGS,
                         help="YAML config(s). First = master (encoder/data/training/...); "
