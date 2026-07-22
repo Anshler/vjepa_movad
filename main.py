@@ -74,7 +74,6 @@ from model import build_multi_head_vjepa
 def parse_configs():
     parser = argparse.ArgumentParser(description="V-JEPA 2.1 + MOVAD anomaly detection")
     _DEFAULT_CONFIGS = [
-        "cfgs/vjepa_mamba.yaml",
         "cfgs/vjepa_slotssm.yaml",
         "cfgs/vjepa_sparse_slotssm.yaml",
     ]
